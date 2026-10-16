@@ -4,6 +4,10 @@
 const { createClient } = window.supabase;
 import { composeEditedMessage, getMessageEditDraft } from "./message-utils.mjs";
 import { ADMIN_COMMANDS, getAdminCommandMatches, parseAdminCommand } from "./admin-commands.mjs";
+import { filterQuickSwitcherEntries } from "./quick-switcher-utils.mjs";
+import { auditEventsToCsv, filterAuditEvents } from "./audit-utils.mjs";
+import { makeMemoryDeck, memoryMatchScore, MEMORY_SYMBOLS } from "./memory-game-utils.mjs";
+import { normalizeCryptoAmount, quoteServerBuybackCoins } from "./crypto-market-utils.mjs";
 // Signals index.html's boot watchdog that the module (incl. CDN imports) loaded.
 window.__pingBooted = true;
 
@@ -714,6 +718,8 @@ let msgChannel = null, dmChannel = null, heartbeat = null;
 let presenceChannel = null, presenceReady = false, presenceByUser = new Map();
 let presenceMode = "online", lastPresenceActivity = Date.now(), lastTrackedPresence = null;
 let presenceRefreshTimer = null, presenceActivityInstalled = false, presenceMenu = null;
+let manualRichPresence = null, spotifyTokens = null, spotifyActivity = null;
+let spotifyPollTimer = null, spotifyPollBusy = false;
 let myIp = null, authMode = "login";
 let lastEmail = "";
 /* view: { type: "channel" } for servers, { type: "dm", uid } or { type:"dm", uid:null } for home */
@@ -781,6 +787,20 @@ function renderOwnPresence() {
   control.title = "Presence: " + presenceLabel(status) + ". Click to change.";
   control.setAttribute("aria-label", "Set presence. Current status: " + presenceLabel(status));
   control.setAttribute("aria-expanded", String(!!presenceMenu));
+  paintUserRichPresence();
+}
+function paintUserRichPresence() {
+  const button = $("user-rich-presence");
+  if (!button || !profile) return;
+  const activity = currentRichPresence();
+  button.replaceChildren();
+  button.classList.toggle("hidden", !activity);
+  if (!activity) return;
+  const node = richPresenceNode(profile, true);
+  if (node) button.appendChild(node);
+  button.title = `View ${activity.app} activity: ${activity.title}`;
+  button.setAttribute("aria-label", button.title);
+  button.onclick = () => openSelfCard();
 }
 function closePresenceMenu() {
   if (!presenceMenu) return;
@@ -834,7 +854,434 @@ function schedulePresenceRefresh() {
     if (!profile || $("app-view").classList.contains("hidden")) return;
     await refreshUsers(true);
     if (view.type === "dm") renderDmList(false);
+    refreshVisibleRichPresence();
   }, 140);
+}
+function richPresenceKey() { return "ping-rich-presence-" + ((profile && profile.id) || "guest"); }
+function spotifyTokenKey() { return "ping-spotify-token-" + ((profile && profile.id) || "guest"); }
+function spotifyOauthKey(kind) { return "ping-spotify-oauth-" + kind + "-" + ((profile && profile.id) || "guest"); }
+function spotifyClientId() { return String((window.ENV && window.ENV.SPOTIFY_CLIENT_ID) || "").trim(); }
+function spotifyRedirectUri() { return window.location.origin + window.location.pathname; }
+function readJsonStorage(key) {
+  try { return JSON.parse(localStorage.getItem(key) || "null"); } catch { return null; }
+}
+function loadRichPresenceSettings() {
+  const saved = readJsonStorage(richPresenceKey());
+  manualRichPresence = saved && saved.title ? {
+    mode: String(saved.mode || "custom").slice(0, 20),
+    app: String(saved.app || "Activity").slice(0, 40),
+    kind: String(saved.kind || "playing").slice(0, 20),
+    title: String(saved.title).slice(0, 80),
+    detail: String(saved.detail || "").slice(0, 100),
+    url: safeActivityUrl(saved.url),
+    startedAt: Number(saved.startedAt) || Date.now(),
+    source: "manual"
+  } : null;
+  spotifyTokens = readJsonStorage(spotifyTokenKey());
+  if (!spotifyTokens || typeof spotifyTokens.accessToken !== "string") spotifyTokens = null;
+}
+function saveManualRichPresence(activity) {
+  manualRichPresence = activity || null;
+  try {
+    if (manualRichPresence) localStorage.setItem(richPresenceKey(), JSON.stringify(manualRichPresence));
+    else localStorage.removeItem(richPresenceKey());
+  } catch { /* local presence storage is optional */ }
+  paintUserRichPresence();
+  refreshVisibleRichPresence();
+}
+function saveSpotifyTokens() {
+  try {
+    if (spotifyTokens) localStorage.setItem(spotifyTokenKey(), JSON.stringify(spotifyTokens));
+    else localStorage.removeItem(spotifyTokenKey());
+  } catch { toast("Spotify connection couldn't be saved in this browser.", "err"); }
+}
+function safeActivityUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" ? url.href : "";
+  } catch { return ""; }
+}
+function isSpotifyArtworkUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" && url.hostname === "i.scdn.co" && url.pathname.startsWith("/image/");
+  } catch { return false; }
+}
+function richPresenceExternalLink(activity) {
+  const url = safeActivityUrl(activity && activity.url);
+  if (!url) return "";
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (activity.app === "Spotify" && host === "open.spotify.com") return url;
+    if (activity.app === "Roblox" && (host === "roblox.com" || host === "www.roblox.com")) return url;
+    if (activity.app === "YouTube" && ["youtube.com", "www.youtube.com", "music.youtube.com", "youtu.be"].includes(host)) return url;
+  } catch { /* invalid external link */ }
+  return "";
+}
+function currentRichPresence() { return spotifyActivity || manualRichPresence; }
+function richPresenceSignature(activity) {
+  if (!activity) return "";
+  return [activity.app, activity.kind, activity.title, activity.detail, activity.url, activity.trackId, activity.playbackTimestamp].join("|");
+}
+function richPresenceForUser(user) {
+  if (!user) return null;
+  if (profile && user.id === profile.id) return currentRichPresence();
+  const states = presenceByUser.get(String(user.id)) || [];
+  return states.map((state) => state.richPresence).find((activity) => activity && activity.title) || null;
+}
+function richPresenceNode(user, compact = false) {
+  const activity = richPresenceForUser(user);
+  if (!activity) return null;
+  const row = el("span", null, "rich-presence" + (compact ? " compact" : ""));
+  if (activity.artwork && isSpotifyArtworkUrl(activity.artwork)) {
+    const art = document.createElement("img");
+    art.src = activity.artwork;
+    art.alt = "";
+    art.loading = "lazy";
+    art.className = "rich-presence-art";
+    row.appendChild(art);
+  } else {
+    const mark = activity.app === "Spotify" ? "♫" : activity.app === "Roblox" ? "◈" : "▶";
+    row.appendChild(el("span", mark, "rich-presence-mark " + (activity.app === "Spotify" ? "spotify" : "")));
+  }
+  const copy = el("span", null, "rich-presence-copy");
+  const verb = activity.kind === "listening" ? "Listening to" : activity.kind === "watching" ? "Watching" : "Playing";
+  copy.appendChild(el("span", verb + " " + activity.app, "rich-presence-app"));
+  copy.appendChild(el("strong", activity.title, "rich-presence-title"));
+  if (activity.detail) copy.appendChild(el("small", activity.detail, "rich-presence-detail"));
+  if (activity.durationMs > 0 && activity.startedAt > 0) {
+    const progress = el("span", null, "rich-presence-progress");
+    const fill = el("span", null, "rich-presence-progress-fill");
+    const current = Math.max(0, Math.min(activity.durationMs, Date.now() - activity.startedAt));
+    fill.style.width = Math.min(100, (current / activity.durationMs) * 100) + "%";
+    progress.appendChild(fill);
+    copy.appendChild(progress);
+  }
+  row.appendChild(copy);
+  return row;
+}
+function richPresenceProfileBlock(user) {
+  const activity = richPresenceForUser(user);
+  const card = el("div", null, "rich-presence-profile");
+  card.dataset.richPresenceUserId = String(user && user.id);
+  if (!activity) { card.classList.add("hidden"); return card; }
+  card.appendChild(el("span", "RICH PRESENCE", "profile-section-title"));
+  card.appendChild(richPresenceNode(user));
+  const url = richPresenceExternalLink(activity);
+  if (url) {
+    const link = el("a", activity.app === "Spotify" ? "Open in Spotify" : activity.app === "Roblox" ? "Open Roblox" : "Open on YouTube", "rich-presence-link");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    card.appendChild(link);
+  }
+  return card;
+}
+function refreshVisibleRichPresence() {
+  const host = document.querySelector("#modal-card.profile-card-modal .rich-presence-profile");
+  if (!host) return;
+  const userId = host.dataset.richPresenceUserId;
+  const user = users.find((item) => String(item.id) === userId)
+    || (profile && String(profile.id) === userId ? profile : null);
+  if (user) host.replaceWith(richPresenceProfileBlock(user));
+}
+function spotifySettingsState() {
+  const status = $("spotify-presence-state");
+  const connect = $("spotify-connect-btn");
+  const redirect = $("spotify-redirect-uri");
+  if (!status || !connect) return;
+  const connected = !!(spotifyTokens && spotifyTokens.refreshToken);
+  status.textContent = spotifyActivity
+    ? "Listening to " + spotifyActivity.title + " on Spotify"
+    : connected ? "Spotify connected · waiting for playback" : spotifyClientId() ? "Spotify is not connected" : "Add a Spotify Client ID to enable automatic listening status";
+  connect.textContent = connected ? "Disconnect Spotify" : "Connect Spotify";
+  if (redirect) redirect.textContent = spotifyRedirectUri();
+}
+function buildSpotifyRandomString(length) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return [...bytes].map((value) => chars[value % chars.length]).join("");
+}
+async function spotifyChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+async function connectSpotify() {
+  const clientId = spotifyClientId();
+  if (!clientId) {
+    toast("Add your Spotify Client ID to SPOTIFY_CLIENT_ID in config.js, then allow the redirect shown in Rich Presence settings.", "err");
+    return;
+  }
+  if (!crypto || !crypto.subtle || !crypto.getRandomValues) {
+    toast("Spotify connection requires a secure HTTPS page.", "err");
+    return;
+  }
+  try {
+    const verifier = buildSpotifyRandomString(64);
+    const challenge = await spotifyChallenge(verifier);
+    const state = buildSpotifyRandomString(32);
+    sessionStorage.setItem(spotifyOauthKey("verifier"), verifier);
+    sessionStorage.setItem(spotifyOauthKey("state"), state);
+    const url = new URL("https://accounts.spotify.com/authorize");
+    url.search = new URLSearchParams({
+      client_id: clientId,
+      response_type: "code",
+      redirect_uri: spotifyRedirectUri(),
+      code_challenge_method: "S256",
+      code_challenge: challenge,
+      state,
+      scope: "user-read-currently-playing"
+    }).toString();
+    window.location.assign(url.href);
+  } catch (error) { toast("Couldn't start Spotify connection: " + (error.message || "browser storage unavailable"), "err"); }
+}
+function clearSpotifyCallbackQuery() {
+  const url = new URL(window.location.href);
+  ["code", "state", "error"].forEach((key) => url.searchParams.delete(key));
+  window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+}
+async function handleSpotifyCallback() {
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get("code");
+  const error = url.searchParams.get("error");
+  if (!code && !error) return false;
+  const state = url.searchParams.get("state");
+  let expectedState = "", verifier = "";
+  try {
+    expectedState = sessionStorage.getItem(spotifyOauthKey("state")) || "";
+    verifier = sessionStorage.getItem(spotifyOauthKey("verifier")) || "";
+    sessionStorage.removeItem(spotifyOauthKey("state"));
+    sessionStorage.removeItem(spotifyOauthKey("verifier"));
+  } catch { /* treat unavailable session state as failed validation */ }
+  clearSpotifyCallbackQuery();
+  if (error) { toast("Spotify connection was cancelled.", "err"); return true; }
+  if (!code || !state || state !== expectedState || !verifier) {
+    toast("Spotify connection state didn't match. Please try again.", "err");
+    return true;
+  }
+  try {
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: spotifyClientId(),
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: spotifyRedirectUri(),
+        code_verifier: verifier
+      })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.access_token) throw new Error(result.error_description || result.error || "token exchange failed");
+    spotifyTokens = {
+      accessToken: result.access_token,
+      refreshToken: result.refresh_token || "",
+      expiresAt: Date.now() + Number(result.expires_in || 3600) * 1000
+    };
+    saveSpotifyTokens();
+    await refreshSpotifyActivity();
+    spotifySettingsState();
+    toast("Spotify connected. Your current track will appear in Ping.", "ok");
+  } catch (exchangeError) {
+    toast("Spotify connection failed: " + (exchangeError.message || "try again"), "err");
+  }
+  return true;
+}
+async function spotifyAccessToken(forceRefresh = false) {
+  if (!spotifyTokens || !spotifyClientId()) return null;
+  if (!forceRefresh && spotifyTokens.accessToken && spotifyTokens.expiresAt > Date.now() + 60000) return spotifyTokens.accessToken;
+  if (!spotifyTokens.refreshToken) return null;
+  try {
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: spotifyClientId(),
+        grant_type: "refresh_token",
+        refresh_token: spotifyTokens.refreshToken
+      })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.access_token) return null;
+    spotifyTokens = {
+      accessToken: result.access_token,
+      refreshToken: result.refresh_token || spotifyTokens.refreshToken,
+      expiresAt: Date.now() + Number(result.expires_in || 3600) * 1000
+    };
+    saveSpotifyTokens();
+    return spotifyTokens.accessToken;
+  } catch { return null; }
+}
+function updateSpotifyActivity(activity) {
+  const before = richPresenceSignature(spotifyActivity);
+  spotifyActivity = activity;
+  spotifySettingsState();
+  paintUserRichPresence();
+  refreshVisibleRichPresence();
+  if (before !== richPresenceSignature(spotifyActivity)) syncPresence();
+}
+async function refreshSpotifyActivity() {
+  if (spotifyPollBusy || !spotifyTokens) return;
+  spotifyPollBusy = true;
+  try {
+    let token = await spotifyAccessToken();
+    if (!token) { updateSpotifyActivity(null); return; }
+    let response = await fetch("https://api.spotify.com/v1/me/player/currently-playing?additional_types=track%2Cepisode", {
+      headers: { Authorization: "Bearer " + token }
+    });
+    if (response.status === 401) {
+      token = await spotifyAccessToken(true);
+      if (!token) { updateSpotifyActivity(null); return; }
+      response = await fetch("https://api.spotify.com/v1/me/player/currently-playing?additional_types=track%2Cepisode", {
+        headers: { Authorization: "Bearer " + token }
+      });
+    }
+    if (response.status === 204) { updateSpotifyActivity(null); return; }
+    if (!response.ok) {
+      if (response.status === 401) updateSpotifyActivity(null);
+      return;
+    }
+    const playback = await response.json();
+    const item = playback && playback.item;
+    if (!playback || !playback.is_playing || !item) { updateSpotifyActivity(null); return; }
+    const artists = Array.isArray(item.artists) ? item.artists.map((artist) => artist.name).filter(Boolean).join(", ") : "";
+    const album = item.album && item.album.name ? item.album.name : item.show && item.show.name ? item.show.name : "";
+    const artwork = item.album && item.album.images && item.album.images[0] && item.album.images[0].url
+      ? item.album.images[0].url : item.images && item.images[0] && item.images[0].url;
+    updateSpotifyActivity({
+      app: "Spotify",
+      kind: "listening",
+      title: String(item.name || "Spotify audio").slice(0, 80),
+      detail: String(artists || album || "").slice(0, 100),
+      subtitle: album,
+      url: safeActivityUrl(item.external_urls && item.external_urls.spotify),
+      artwork: isSpotifyArtworkUrl(artwork) ? artwork : "",
+      startedAt: Date.now() - Math.max(0, Number(playback.progress_ms) || 0),
+      durationMs: Math.max(0, Number(item.duration_ms) || 0),
+      trackId: String(item.uri || item.id || item.name || ""),
+      playbackTimestamp: Number(playback.timestamp) || 0,
+      source: "spotify"
+    });
+  } catch { /* Keep the last activity through temporary network errors. */ }
+  finally { spotifyPollBusy = false; }
+}
+function startRichPresenceSync() {
+  loadRichPresenceSettings();
+  void (async () => {
+    await handleSpotifyCallback();
+    clearInterval(spotifyPollTimer);
+    if (spotifyTokens) {
+      await refreshSpotifyActivity();
+      spotifyPollTimer = setInterval(() => refreshSpotifyActivity(), 30000);
+    }
+    syncPresence();
+  })();
+}
+function richPresenceModeDetails(mode) {
+  if (mode === "spotify") return { app: "Spotify", kind: "listening" };
+  if (mode === "youtube") return { app: "YouTube", kind: "listening" };
+  if (mode === "roblox") return { app: "Roblox", kind: "playing" };
+  if (mode === "game") return { app: "Game", kind: "playing" };
+  if (mode === "watching") return { app: "Activity", kind: "watching" };
+  return { app: "Activity", kind: "playing" };
+}
+function paintSpotifySettingsState() {
+  const status = $("spotify-presence-state");
+  const connect = $("spotify-connect-btn");
+  if (!status || !connect) return;
+  const connected = !!(spotifyTokens && spotifyTokens.refreshToken);
+  status.textContent = spotifyActivity ? "Listening to " + spotifyActivity.title + " on Spotify"
+    : connected ? "Spotify connected · waiting for playback"
+      : spotifyClientId() ? "Spotify is not connected" : "Add a Spotify Client ID to enable auto-presence";
+  connect.textContent = connected ? "Disconnect Spotify" : "Connect Spotify";
+  const redirect = $("spotify-redirect-uri");
+  if (redirect) redirect.textContent = spotifyRedirectUri();
+}
+function appendRichPresenceSettings(body) {
+  body.appendChild(el("div", "RICH PRESENCE", "chan-group settings-section-heading"));
+  const panel = el("section", null, "rich-presence-settings");
+  panel.appendChild(el("p", "Spotify playback syncs automatically. Set a manual activity for Roblox or other apps; it appears when Spotify isn't playing.", "muted small"));
+  const spotifyRow = el("div", null, "rich-presence-spotify-settings");
+  const spotifyMeta = el("div", null, "rich-presence-spotify-meta");
+  spotifyMeta.append(el("strong", "Spotify"), el("span", "Connect your account to show your current track.", "muted small"));
+  const spotifyActions = el("div", null, "rich-presence-spotify-actions");
+  const spotifyState = el("div", "Checking Spotify…", "muted small");
+  spotifyState.id = "spotify-presence-state";
+  const spotifyConnect = el("button", "Connect Spotify", "btn-secondary");
+  spotifyConnect.type = "button";
+  spotifyConnect.id = "spotify-connect-btn";
+  spotifyConnect.onclick = async () => {
+    if (spotifyTokens && spotifyTokens.refreshToken) {
+      spotifyTokens = null;
+      saveSpotifyTokens();
+      clearInterval(spotifyPollTimer);
+      spotifyPollTimer = null;
+      updateSpotifyActivity(null);
+      paintSpotifySettingsState();
+      toast("Spotify disconnected.", "ok");
+    } else {
+      await connectSpotify();
+    }
+  };
+  spotifyActions.append(spotifyState, spotifyConnect);
+  const redirect = el("code", spotifyRedirectUri(), "rich-presence-redirect");
+  redirect.id = "spotify-redirect-uri";
+  spotifyMeta.appendChild(redirect);
+  spotifyRow.append(spotifyMeta, spotifyActions);
+  panel.appendChild(spotifyRow);
+
+  const manualTitle = el("div", "Manual activity", "profile-editor-subtitle");
+  panel.appendChild(manualTitle);
+  const form = el("div", null, "rich-presence-manual-form");
+  const mode = el("select");
+  mode.id = "rich-presence-mode";
+  mode.setAttribute("aria-label", "Activity app");
+  for (const [value, label] of [["spotify", "Spotify"], ["roblox", "Roblox"], ["youtube", "YouTube"], ["game", "Another game"], ["watching", "Watching"], ["custom", "Custom activity"]]) {
+    const option = el("option", label); option.value = value; mode.appendChild(option);
+  }
+  const title = el("input");
+  title.id = "rich-presence-title"; title.type = "text"; title.maxLength = 80;
+  title.placeholder = "Song, experience, or activity"; title.setAttribute("aria-label", "Activity title");
+  const detail = el("input");
+  detail.id = "rich-presence-detail"; detail.type = "text"; detail.maxLength = 100;
+  detail.placeholder = "Artist, game mode, or details"; detail.setAttribute("aria-label", "Activity details");
+  const link = el("input");
+  link.id = "rich-presence-url"; link.type = "url"; link.maxLength = 300;
+  link.placeholder = "Optional https link"; link.setAttribute("aria-label", "Activity link");
+  if (manualRichPresence) {
+    mode.value = manualRichPresence.mode || "custom";
+    title.value = manualRichPresence.title || "";
+    detail.value = manualRichPresence.detail || "";
+    link.value = manualRichPresence.url || "";
+  }
+  form.append(mode, title, detail, link);
+  panel.appendChild(form);
+  const actions = el("div", null, "rich-presence-manual-actions");
+  const save = el("button", "Save activity", "btn-primary");
+  save.type = "button";
+  save.onclick = async () => {
+    const name = title.value.trim();
+    if (!name) { toast("Enter an activity title.", "err"); title.focus(); return; }
+    const url = safeActivityUrl(link.value.trim());
+    if (link.value.trim() && !url) { toast("Activity links must use https.", "err"); link.focus(); return; }
+    const { app, kind } = richPresenceModeDetails(mode.value);
+    saveManualRichPresence({ mode: mode.value, app, kind, title: name.slice(0, 80), detail: detail.value.trim().slice(0, 100), url, startedAt: Date.now(), source: "manual" });
+    await syncPresence();
+    toast("Rich presence updated.", "ok");
+    paintSpotifySettingsState();
+  };
+  const clear = el("button", "Clear activity", "btn-secondary");
+  clear.type = "button";
+  clear.onclick = async () => {
+    saveManualRichPresence(null);
+    await syncPresence();
+    title.value = ""; detail.value = ""; link.value = "";
+    toast("Manual activity cleared.", "ok");
+  };
+  actions.append(save, clear);
+  panel.appendChild(actions);
+  body.appendChild(panel);
+  paintSpotifySettingsState();
 }
 async function syncPresence() {
   if (!presenceChannel || !presenceReady || !profile) return;
@@ -843,9 +1290,25 @@ async function syncPresence() {
     if (status === "invisible") {
       if (lastTrackedPresence !== "invisible") await presenceChannel.untrack();
       lastTrackedPresence = "invisible";
-    } else if (lastTrackedPresence !== status) {
-      await presenceChannel.track({ username: profile.username, status });
-      lastTrackedPresence = status;
+    } else {
+      const activity = currentRichPresence();
+      const signature = status + "|" + richPresenceSignature(activity);
+      if (lastTrackedPresence !== signature) {
+        const richPresence = activity ? {
+          app: String(activity.app || "Activity").slice(0, 40),
+          kind: String(activity.kind || "playing").slice(0, 20),
+          title: String(activity.title || "").slice(0, 80),
+          detail: String(activity.detail || "").slice(0, 100),
+          url: richPresenceExternalLink(activity),
+          artwork: isSpotifyArtworkUrl(activity.artwork) ? activity.artwork : "",
+          trackId: String(activity.trackId || "").slice(0, 100),
+          playbackTimestamp: Number(activity.playbackTimestamp) || 0,
+          startedAt: Number(activity.startedAt) || 0,
+          durationMs: Math.max(0, Number(activity.durationMs) || 0)
+        } : null;
+        await presenceChannel.track({ username: profile.username, status, richPresence });
+        lastTrackedPresence = signature;
+      }
     }
   } catch { /* the database activity timestamp remains a fallback */ }
   renderOwnPresence();
@@ -860,9 +1323,11 @@ async function setPresenceMode(status) {
 }
 function startPresence() {
   if (!supabase || !session || presenceChannel) return;
+  loadRichPresenceSettings();
   try {
     const channel = supabase.channel("ping-presence", { config: { presence: { key: String(session.user.id) } } });
     presenceChannel = channel;
+    startRichPresenceSync();
     channel.on("presence", { event: "sync" }, () => {
       presenceByUser = new Map(Object.entries(channel.presenceState()));
       presenceReady = true;
@@ -871,6 +1336,7 @@ function startPresence() {
     }).subscribe((status) => {
       if (status === "SUBSCRIBED") {
         presenceReady = true;
+        lastTrackedPresence = null;
         schedulePresenceRefresh();
         syncPresence();
       }
@@ -1234,6 +1700,7 @@ async function loadServers() {
   }
   if (!activeServer || !servers.find((s) => s.id === activeServer.id))
     activeServer = servers.find((s) => s.name === "Ping Public Chat") || servers[0] || null;
+  loadServerFolderState();
   renderServerRail();
   // Boost counts load lazily so the rail paints fast; pips fill in after.
   refreshAllBoosts().catch(() => {});
@@ -1289,71 +1756,880 @@ function paintDmUnread() {
   home.title = total ? total + " unread direct message" + (total === 1 ? "" : "s") : "Home";
 }
 
+let serverFolderState = { folders: [], assignments: {}, collapsed: [], order: [] };
+function serverFolderStorageKey() {
+  return "ping-server-folders-" + ((profile && profile.id) || "guest");
+}
+function cleanServerFolderName(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").slice(0, 24);
+}
+function saveServerFolderState() {
+  try {
+    localStorage.setItem(serverFolderStorageKey(), JSON.stringify(serverFolderState));
+    return true;
+  } catch {
+    toast("Folder changes are active, but couldn't be saved in this browser.", "err");
+    return false;
+  }
+}
+function loadServerFolderState() {
+  let saved = null;
+  try {
+    const raw = localStorage.getItem(serverFolderStorageKey());
+    if (raw) saved = JSON.parse(raw);
+  } catch { /* reset malformed or unavailable local state */ }
+  if (saved && Array.isArray(saved.folders)) {
+    const folders = [];
+    const byName = new Map();
+    for (const value of saved.folders) {
+      const name = cleanServerFolderName(value);
+      const key = name.toLocaleLowerCase();
+      if (name && !byName.has(key)) { folders.push(name); byName.set(key, name); }
+    }
+    const validServerIds = new Set(servers.map((server) => String(server.id)));
+    const assignments = {};
+    for (const [serverId, value] of Object.entries(saved.assignments || {})) {
+      const folder = byName.get(cleanServerFolderName(value).toLocaleLowerCase());
+      if (folder && validServerIds.has(serverId)) assignments[serverId] = folder;
+    }
+    const order = [...new Set((Array.isArray(saved.order) ? saved.order : []).map(String).filter((id) => validServerIds.has(id)))];
+    for (const server of servers) if (!order.includes(String(server.id))) order.push(String(server.id));
+    serverFolderState = {
+      folders,
+      assignments,
+      order,
+      collapsed: [...new Set((Array.isArray(saved.collapsed) ? saved.collapsed : [])
+        .map((value) => byName.get(cleanServerFolderName(value).toLocaleLowerCase()))
+        .filter(Boolean))]
+    };
+    return;
+  }
+
+  // Import assignments from the earlier shared-folder prototype into private
+  // browser state once, without changing the server record.
+  const folders = [];
+  const assignments = {};
+  for (const server of servers) {
+    const name = cleanServerFolderName(server.folder);
+    if (!name) continue;
+    if (!folders.some((folder) => folder.toLocaleLowerCase() === name.toLocaleLowerCase())) folders.push(name);
+    assignments[String(server.id)] = name;
+  }
+  serverFolderState = { folders, assignments, collapsed: [], order: servers.map((server) => String(server.id)) };
+  if (folders.length) saveServerFolderState();
+}
+
+function orderedServers() {
+  const serverIds = new Set(servers.map((server) => String(server.id)));
+  const order = (Array.isArray(serverFolderState.order) ? serverFolderState.order : [])
+    .map(String).filter((id) => serverIds.has(id));
+  for (const server of servers) if (!order.includes(String(server.id))) order.push(String(server.id));
+  serverFolderState.order = order;
+  const rank = new Map(order.map((id, index) => [id, index]));
+  return [...servers].sort((a, b) => rank.get(String(a.id)) - rank.get(String(b.id)));
+}
+function moveServerInOrder(serverId, direction) {
+  const id = String(serverId);
+  const folder = serverFolderState.assignments[id] || "";
+  const group = orderedServers().filter((server) => (serverFolderState.assignments[String(server.id)] || "") === folder)
+    .map((server) => String(server.id));
+  const index = group.indexOf(id), targetIndex = index + direction;
+  if (index < 0 || targetIndex < 0 || targetIndex >= group.length) return;
+  [group[index], group[targetIndex]] = [group[targetIndex], group[index]];
+  const groupSet = new Set(group);
+  let nextIndex = 0;
+  serverFolderState.order = orderedServers().map((server) => {
+    const current = String(server.id);
+    return groupSet.has(current) ? group[nextIndex++] : current;
+  });
+  saveServerFolderState();
+  renderServerFolderManager();
+  renderServerRail();
+}
+function moveServerBefore(serverId, targetId) {
+  const source = String(serverId), target = String(targetId);
+  if (source === target) return;
+  const order = orderedServers().map((server) => String(server.id));
+  const sourceIndex = order.indexOf(source), targetIndex = order.indexOf(target);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  order.splice(sourceIndex, 1);
+  order.splice(order.indexOf(target), 0, source);
+  serverFolderState.order = order;
+  const targetFolder = serverFolderState.assignments[target] || "";
+  if (targetFolder) serverFolderState.assignments[source] = targetFolder;
+  else delete serverFolderState.assignments[source];
+  saveServerFolderState();
+  renderServerFolderManager();
+  renderServerRail();
+}
+function assignServerToFolder(serverId, folder) {
+  const id = String(serverId);
+  if (folder) serverFolderState.assignments[id] = folder;
+  else delete serverFolderState.assignments[id];
+  const order = orderedServers().map((server) => String(server.id)).filter((serverIdValue) => serverIdValue !== id);
+  const peers = folder ? order.filter((serverIdValue) => serverFolderState.assignments[serverIdValue] === folder) : [];
+  if (peers.length) order.splice(order.lastIndexOf(peers[peers.length - 1]) + 1, 0, id);
+  else order.push(id);
+  serverFolderState.order = order;
+  saveServerFolderState();
+  renderServerFolderManager();
+  renderServerRail();
+}
+function moveServerFolderOrder(index, direction) {
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= serverFolderState.folders.length) return;
+  [serverFolderState.folders[index], serverFolderState.folders[target]] =
+    [serverFolderState.folders[target], serverFolderState.folders[index]];
+  saveServerFolderState();
+  renderServerFolderManager();
+  renderServerRail();
+}
+function bindServerDropTarget(node, folder) {
+  node.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    node.classList.add("drop-target");
+  });
+  node.addEventListener("dragleave", (event) => {
+    if (!event.relatedTarget || !node.contains(event.relatedTarget)) node.classList.remove("drop-target");
+  });
+  node.addEventListener("drop", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    node.classList.remove("drop-target");
+    const serverId = event.dataTransfer && event.dataTransfer.getData("text/plain");
+    if (serverId) assignServerToFolder(serverId, folder);
+  });
+}
+
 function renderServerRail() {
   const box = $("server-icons");
-  box.innerHTML = "";
-  const railButton = (s) => {
-    const b = el("button", null, "server-icon");
-    b.title = s.name;
-    if (s.icon_color) b.style.background = s.icon_color;
-    if (activeServer && s.id === activeServer.id) b.classList.add("active");
-    if (s.icon_url && isSafeImg(s.icon_url)) {
+  box.replaceChildren();
+  const railButton = (server) => {
+    const button = el("button", null, "server-icon");
+    button.title = server.name;
+    button.type = "button";
+    button.draggable = true;
+    button.dataset.serverId = String(server.id);
+    button.setAttribute("aria-label", "Open " + server.name);
+    if (server.icon_color) button.style.background = server.icon_color;
+    if (activeServer && server.id === activeServer.id) {
+      button.classList.add("active");
+      button.setAttribute("aria-current", "page");
+    }
+    if (server.icon_url && isSafeImg(server.icon_url)) {
       const img = document.createElement("img");
-      img.src = s.icon_url;
+      img.src = server.icon_url;
       img.alt = "";
       img.className = "server-icon-img";
-      b.appendChild(img);
+      button.appendChild(img);
     } else {
-      b.appendChild(el("span", s.name.slice(0, 1).toUpperCase()));
+      button.appendChild(el("span", server.name.slice(0, 1).toUpperCase()));
     }
-    // Boost level pip.
-    const lvl = serverBoostLevel(s.id);
-    if (lvl > 0) {
-      const pip = el("span", "◆" + lvl, "server-boost-pip lvl" + lvl);
-      b.appendChild(pip);
-    }
-    b.onclick = () => {
+    const level = serverBoostLevel(server.id);
+    if (level > 0) button.appendChild(el("span", "◆" + level, "server-boost-pip lvl" + level));
+    button.addEventListener("dragstart", (event) => {
+      event.dataTransfer?.setData("text/plain", String(server.id));
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+      button.classList.add("dragging");
+    });
+    button.addEventListener("dragend", () => {
+      button.classList.remove("dragging");
+      document.querySelectorAll(".server-icon.drop-target").forEach((node) => node.classList.remove("drop-target"));
+      document.querySelectorAll(".server-folder.drop-target, .server-folder-members.drop-target").forEach((node) => node.classList.remove("drop-target"));
+    });
+    button.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      button.classList.add("drop-target");
+    });
+    button.addEventListener("dragleave", (event) => {
+      if (!event.relatedTarget || !button.contains(event.relatedTarget)) button.classList.remove("drop-target");
+    });
+    button.addEventListener("drop", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.classList.remove("drop-target");
+      const sourceId = event.dataTransfer && event.dataTransfer.getData("text/plain");
+      if (sourceId) moveServerBefore(sourceId, server.id);
+    });
+    button.onclick = () => {
       view = { type: "channel" };
-      activeServer = s;
+      activeServer = server;
       renderServerRail();
       loadChannels();
     };
-    return b;
+    return button;
   };
-  // Servers grouped into collapsible folders (Discord-style), ungrouped last.
-  const byFolder = new Map();
-  for (const s of servers) {
-    const key = (s.folder || "").trim();
-    if (!key) continue;
-    if (!byFolder.has(key)) byFolder.set(key, []);
-    byFolder.get(key).push(s);
-  }
-  let lastFolder = null;
-  for (const s of servers) {
-    const folder = (s.folder || "").trim();
-    if (folder !== lastFolder && folder) {
-      lastFolder = folder;
-      const members = byFolder.get(folder) || [];
-      const head = el("button", null, "server-folder");
-      head.type = "button";
-      head.appendChild(el("span", null, "server-folder-arrow"));
-      head.appendChild(el("span", folder));
-      head.appendChild(el("span", String(members.length), "server-folder-count"));
-      head.onclick = () => {
-        head.classList.toggle("open");
-        head.nextElementSibling.classList.toggle("hidden");
-      };
-      box.appendChild(head);
-      const wrap = el("div", null, "server-folder-members");
-      for (const member of members) wrap.appendChild(railButton(member));
-      box.appendChild(wrap);
-    } else if (!folder) {
-      box.appendChild(railButton(s));
-    }
+
+  const sortedServers = orderedServers();
+  serverFolderState.folders.forEach((folder, index) => {
+    const members = sortedServers.filter((server) => serverFolderState.assignments[String(server.id)] === folder);
+    const collapsed = serverFolderState.collapsed.includes(folder);
+    const heading = el("button", null, "server-folder");
+    const groupId = "server-folder-members-" + index;
+    heading.type = "button";
+    heading.classList.toggle("open", !collapsed);
+    heading.classList.toggle("has-active", members.some((server) => activeServer && server.id === activeServer.id));
+    heading.setAttribute("aria-expanded", String(!collapsed));
+    heading.setAttribute("aria-controls", groupId);
+    heading.appendChild(el("span", null, "server-folder-arrow"));
+    heading.appendChild(el("span", folder, "server-folder-name"));
+    heading.appendChild(el("span", String(members.length), "server-folder-count"));
+    heading.onclick = () => {
+      const collapsedFolders = new Set(serverFolderState.collapsed);
+      if (collapsedFolders.has(folder)) collapsedFolders.delete(folder);
+      else collapsedFolders.add(folder);
+      serverFolderState.collapsed = [...collapsedFolders];
+      saveServerFolderState();
+      renderServerRail();
+    };
+    bindServerDropTarget(heading, folder);
+    box.appendChild(heading);
+    const group = el("div", null, "server-folder-members");
+    group.id = groupId;
+    group.classList.toggle("hidden", collapsed);
+    bindServerDropTarget(group, folder);
+    for (const member of members) group.appendChild(railButton(member));
+    box.appendChild(group);
+  });
+  for (const server of sortedServers) {
+    if (!serverFolderState.assignments[String(server.id)]) box.appendChild(railButton(server));
   }
   const home = document.querySelector("#server-rail .home");
   if (home) home.classList.toggle("active", view.type !== "channel");
   paintDmUnread();
+}
+
+function renderServerFolderManager() {
+  const list = $("server-folder-manager-list");
+  list.replaceChildren();
+  const foldersSection = el("section", null, "server-folder-manager-section");
+  foldersSection.appendChild(el("h3", "Your folders"));
+  if (!serverFolderState.folders.length) {
+    foldersSection.appendChild(el("p", "No folders yet. Create one above to start organizing.", "server-folder-manager-empty muted small"));
+  }
+  for (const [folderIndex, folder] of serverFolderState.folders.entries()) {
+    const row = el("div", null, "server-folder-edit-row");
+    const name = el("input");
+    name.type = "text";
+    name.value = folder;
+    name.maxLength = 24;
+    name.setAttribute("aria-label", "Rename folder " + folder);
+    name.onchange = () => {
+      const next = cleanServerFolderName(name.value);
+      if (!next) { toast("Folder names can't be empty.", "err"); renderServerFolderManager(); return; }
+      if (serverFolderState.folders.some((item) => item !== folder && item.toLocaleLowerCase() === next.toLocaleLowerCase())) {
+        toast("A folder with that name already exists.", "err");
+        renderServerFolderManager();
+        return;
+      }
+      serverFolderState.folders = serverFolderState.folders.map((item) => item === folder ? next : item);
+      for (const serverId of Object.keys(serverFolderState.assignments)) {
+        if (serverFolderState.assignments[serverId] === folder) serverFolderState.assignments[serverId] = next;
+      }
+      serverFolderState.collapsed = serverFolderState.collapsed.map((item) => item === folder ? next : item);
+      saveServerFolderState();
+      renderServerFolderManager();
+      renderServerRail();
+    };
+    const moveControls = el("div", null, "server-folder-order-controls");
+    for (const [direction, label] of [[-1, "Move folder up"], [1, "Move folder down"]]) {
+      const move = el("button", direction < 0 ? "↑" : "↓", "server-order-button");
+      move.type = "button";
+      move.title = label;
+      move.setAttribute("aria-label", label + ": " + folder);
+      move.dataset.moveFolder = String(folderIndex);
+      move.dataset.direction = String(direction);
+      move.disabled = direction < 0 ? folderIndex === 0 : folderIndex === serverFolderState.folders.length - 1;
+      moveControls.appendChild(move);
+    }
+    const remove = el("button", "Remove", "btn-secondary server-folder-remove");
+    remove.type = "button";
+    remove.title = "Remove this folder; its servers will become unfiled";
+    remove.dataset.removeFolder = folder;
+    row.append(name, moveControls, remove);
+    foldersSection.appendChild(row);
+  }
+  list.appendChild(foldersSection);
+
+  const placementSection = el("section", null, "server-folder-manager-section");
+  placementSection.appendChild(el("h3", "Server placement"));
+  if (!servers.length) placementSection.appendChild(el("p", "No servers to organize yet.", "server-folder-manager-empty muted small"));
+  const sortedServers = orderedServers();
+  for (const server of sortedServers) {
+    const row = el("div", null, "server-folder-placement-row");
+    row.appendChild(el("span", server.name, "server-folder-placement-name"));
+    const select = el("select");
+    select.dataset.serverId = String(server.id);
+    select.setAttribute("aria-label", "Folder for " + server.name);
+    const unfiled = el("option", "Unfiled");
+    unfiled.value = "";
+    select.appendChild(unfiled);
+    for (const folder of serverFolderState.folders) {
+      const option = el("option", folder);
+      option.value = folder;
+      select.appendChild(option);
+    }
+    select.value = serverFolderState.assignments[String(server.id)] || "";
+    row.appendChild(select);
+    const folder = serverFolderState.assignments[String(server.id)] || "";
+    const sameGroup = sortedServers.filter((item) => (serverFolderState.assignments[String(item.id)] || "") === folder);
+    const position = sameGroup.findIndex((item) => item.id === server.id);
+    const moveControls = el("div", null, "server-folder-order-controls");
+    for (const [direction, label] of [[-1, "Move server up"], [1, "Move server down"]]) {
+      const move = el("button", direction < 0 ? "↑" : "↓", "server-order-button");
+      move.type = "button";
+      move.title = label;
+      move.setAttribute("aria-label", label + ": " + server.name);
+      move.dataset.moveServer = String(server.id);
+      move.dataset.direction = String(direction);
+      move.disabled = direction < 0 ? position === 0 : position === sameGroup.length - 1;
+      moveControls.appendChild(move);
+    }
+    row.appendChild(moveControls);
+    placementSection.appendChild(row);
+  }
+  list.appendChild(placementSection);
+}
+
+function openServerFolderManager() {
+  const dialog = $("server-folder-dialog");
+  renderServerFolderManager();
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("server-folder-new-name").focus(), 0);
+}
+
+function bindServerFolderManager() {
+  const dialog = $("server-folder-dialog");
+  $("server-folders-btn").onclick = openServerFolderManager;
+  $("server-folder-close").onclick = () => dialog.close();
+  $("server-folder-done").onclick = () => dialog.close();
+  dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+  $("server-folder-create-form").onsubmit = (event) => {
+    event.preventDefault();
+    const input = $("server-folder-new-name");
+    const name = cleanServerFolderName(input.value);
+    if (!name) return;
+    if (serverFolderState.folders.some((folder) => folder.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      toast("A folder with that name already exists.", "err");
+      return;
+    }
+    serverFolderState.folders.push(name);
+    saveServerFolderState();
+    input.value = "";
+    renderServerFolderManager();
+    renderServerRail();
+    $("server-folder-new-name").focus();
+  };
+  $("server-folder-manager-list").addEventListener("change", (event) => {
+    const select = event.target.closest("select[data-server-id]");
+    if (!select) return;
+    assignServerToFolder(select.dataset.serverId, select.value);
+  });
+  $("server-folder-manager-list").addEventListener("click", (event) => {
+    const moveFolder = event.target.closest("button[data-move-folder]");
+    if (moveFolder) {
+      moveServerFolderOrder(Number(moveFolder.dataset.moveFolder), Number(moveFolder.dataset.direction));
+      return;
+    }
+    const moveServer = event.target.closest("button[data-move-server]");
+    if (moveServer) {
+      moveServerInOrder(moveServer.dataset.moveServer, Number(moveServer.dataset.direction));
+      return;
+    }
+    const button = event.target.closest("button[data-remove-folder]");
+    if (!button) return;
+    const folder = button.dataset.removeFolder;
+    serverFolderState.folders = serverFolderState.folders.filter((item) => item !== folder);
+    serverFolderState.collapsed = serverFolderState.collapsed.filter((item) => item !== folder);
+    for (const serverId of Object.keys(serverFolderState.assignments)) {
+      if (serverFolderState.assignments[serverId] === folder) delete serverFolderState.assignments[serverId];
+    }
+    saveServerFolderState();
+    renderServerFolderManager();
+    renderServerRail();
+  });
+}
+
+let quickSwitcherChannels = [];
+let quickSwitcherSequence = 0;
+let quickSwitcherIndex = 0;
+let quickSwitcherChannelsLoading = false;
+function quickSwitcherViews() {
+  const entries = [
+    { label: "Direct Messages", detail: "Home", icon: "✉", run: enterHome },
+    { label: "Friends", detail: "People and requests", icon: "♙", run: () => openFriends() },
+    { label: "Saved Messages", detail: "Your private library", icon: "☆", run: openSavedMessages },
+    { label: "Shop", detail: "Cosmetics and items", icon: "🛍", run: openShop },
+    { label: "Quests", detail: "Daily rewards", icon: "⚔", run: openQuests },
+    { label: "Events", detail: "Community schedule", icon: "▦", run: openEvents },
+    { label: "Games & Apps", detail: "Ping Arcade", icon: "🎮", run: openGames },
+    { label: "Explore Servers", detail: "Discover communities", icon: "🧭", run: openExplore },
+    { label: "Settings", detail: "Profile and preferences", icon: "⚙", run: openSettings }
+  ];
+  if (profile && (profile.role === "admin" || profile.role === "mod")) {
+    entries.push({ label: "Admin Dashboard", detail: "Manage Ping", icon: "♛", run: () => { showView("dashboard-view"); loadDashboard(); } });
+  }
+  if (voiceId) entries.unshift({ label: "Return to voice call", detail: $("voice-name").textContent || "Connected call", icon: "🔊", run: () => showView("voice-view") });
+  return entries;
+}
+function quickSwitcherEntries(query) {
+  const entries = [];
+  for (const server of servers) {
+    entries.push({
+      kind: "server", label: server.name, detail: "Server", icon: "◉",
+      search: server.name + " server", value: server
+    });
+  }
+  const serverById = new Map(servers.map((server) => [String(server.id), server]));
+  for (const channel of quickSwitcherChannels) {
+    const server = serverById.get(String(channel.server_id));
+    if (!server) continue;
+    entries.push({
+      kind: "channel", label: channel.name,
+      detail: (channel.kind === "voice" ? "Voice · " : "Channel · ") + server.name,
+      icon: channel.kind === "voice" ? "🔊" : "#",
+      search: channel.name + " " + server.name + " " + (channel.kind || "text"),
+      value: { channel, server }
+    });
+  }
+  for (const user of users) {
+    if (user.id === session.user.id) continue;
+    entries.push({ kind: "person", label: user.username, detail: "Start a direct message", icon: "♙", search: user.username + " person", value: user });
+  }
+  for (const viewEntry of quickSwitcherViews()) {
+    entries.push({ kind: "view", ...viewEntry, search: viewEntry.label + " " + viewEntry.detail + " view" });
+  }
+
+  const q = query.trim().toLocaleLowerCase();
+  if (!q) {
+    const currentServer = activeServer && entries.find((entry) => entry.kind === "server" && entry.value.id === activeServer.id);
+    const defaults = [currentServer, ...entries.filter((entry) => entry.kind === "view"), ...entries.filter((entry) => entry.kind === "server" && entry !== currentServer)];
+    return defaults.filter(Boolean).slice(0, 18);
+  }
+  return filterQuickSwitcherEntries(entries, q, 30);
+}
+function renderQuickSwitcher() {
+  const input = $("quick-switcher-input");
+  const results = $("quick-switcher-results");
+  const entries = quickSwitcherEntries(input.value);
+  results.replaceChildren();
+  if (!entries.length) {
+    quickSwitcherIndex = 0;
+    input.removeAttribute("aria-activedescendant");
+    results.appendChild(el("div", quickSwitcherChannelsLoading ? "Searching your channels…" : "No matches. Try a server, channel, username, or view.", "quick-switcher-empty"));
+    return;
+  }
+  quickSwitcherIndex = Math.min(quickSwitcherIndex, entries.length - 1);
+  entries.forEach((entry, index) => {
+    const result = el("button", null, "quick-switcher-result" + (index === quickSwitcherIndex ? " selected" : ""));
+    result.type = "button";
+    result.id = "quick-switcher-option-" + index;
+    result.setAttribute("role", "option");
+    result.setAttribute("aria-selected", String(index === quickSwitcherIndex));
+    const mark = el("span", entry.icon, "quick-switcher-result-icon " + entry.kind);
+    const text = el("span", null, "quick-switcher-result-copy");
+    text.appendChild(el("strong", entry.label));
+    text.appendChild(el("small", entry.detail));
+    result.append(mark, text, el("span", "↵", "quick-switcher-result-enter"));
+    result.onclick = () => activateQuickSwitcherEntry(entry);
+    results.appendChild(result);
+  });
+  input.setAttribute("aria-activedescendant", "quick-switcher-option-" + quickSwitcherIndex);
+}
+async function activateQuickSwitcherEntry(entry) {
+  const dialog = $("quick-switcher-dialog");
+  if (dialog.open) dialog.close();
+  setMobileNav(false);
+  if (entry.kind === "server") {
+    const server = servers.find((item) => item.id === entry.value.id);
+    if (!server) return;
+    if (!activeServer || activeServer.id !== server.id) activeChannel = null;
+    activeServer = server;
+    await loadChannels();
+    return;
+  }
+  if (entry.kind === "channel") {
+    const { channel, server } = entry.value;
+    if (!activeServer || activeServer.id !== server.id) activeChannel = null;
+    activeServer = server;
+    await loadChannels();
+    const target = channels.find((item) => item.id === channel.id);
+    if (!target) return;
+    if ((target.kind || "text") === "voice") {
+      if (voiceId === target.id) showVoiceView(); else await joinVoice(target);
+    } else {
+      await selectChannel(target.id);
+    }
+    return;
+  }
+  if (entry.kind === "person") { await openDM(entry.value.id); return; }
+  if (entry.kind === "view") await entry.run();
+}
+async function openQuickSwitcher() {
+  const dialog = $("quick-switcher-dialog");
+  const input = $("quick-switcher-input");
+  if (dialog.open) { input.focus(); input.select(); return; }
+  const request = ++quickSwitcherSequence;
+  input.value = "";
+  quickSwitcherIndex = 0;
+  quickSwitcherChannelsLoading = !!servers.length;
+  $("quick-switcher-btn").setAttribute("aria-expanded", "true");
+  input.setAttribute("aria-expanded", "true");
+  renderQuickSwitcher();
+  dialog.showModal();
+  input.focus();
+  if (!servers.length) { quickSwitcherChannelsLoading = false; return; }
+  const { data, error } = await supabase.from("channels")
+    .select("id,name,kind,server_id").in("server_id", servers.map((server) => server.id)).limit(500);
+  if (request !== quickSwitcherSequence || !dialog.open) return;
+  quickSwitcherChannelsLoading = false;
+  if (error) {
+    toast("Couldn't search channels: " + error.message, "err");
+    renderQuickSwitcher();
+    return;
+  }
+  quickSwitcherChannels = data || [];
+  renderQuickSwitcher();
+}
+function bindQuickSwitcher() {
+  const dialog = $("quick-switcher-dialog");
+  const input = $("quick-switcher-input");
+  const button = $("quick-switcher-btn");
+  button.onclick = openQuickSwitcher;
+  dialog.addEventListener("close", () => {
+    quickSwitcherSequence++;
+    button.setAttribute("aria-expanded", "false");
+    input.setAttribute("aria-expanded", "false");
+  });
+  input.addEventListener("input", () => { quickSwitcherIndex = 0; renderQuickSwitcher(); });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const count = $("quick-switcher-results").querySelectorAll("[role=option]").length;
+      if (!count) return;
+      quickSwitcherIndex = (quickSwitcherIndex + (event.key === "ArrowDown" ? 1 : -1) + count) % count;
+      renderQuickSwitcher();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const selected = $("quick-switcher-results").querySelector("[aria-selected=true]");
+      if (selected) selected.click();
+    }
+  });
+}
+
+let cryptoMenuMode = "miner";
+let cryptoWallet = { balance: 0, pending: 0, miningStartedAt: null, ratePerHour: 60, capHours: 12 };
+let cryptoRefreshTimer = null;
+let cryptoAssetCatalog = [];
+let cryptoAssetBalances = new Map();
+function setCryptoPanel(mode) {
+  cryptoMenuMode = mode === "market" ? "market" : "miner";
+  const market = cryptoMenuMode === "market";
+  $("crypto-title").textContent = market ? "Black Market" : "Crypto Miner";
+  $("crypto-miner-panel").classList.toggle("hidden", market);
+  $("blackmarket-panel").classList.toggle("hidden", !market);
+  $("crypto-pending").classList.toggle("hidden", market);
+  $("crypto-tab-miner").classList.toggle("active", !market);
+  $("crypto-tab-market").classList.toggle("active", market);
+  $("crypto-tab-miner").setAttribute("aria-pressed", String(!market));
+  $("crypto-tab-market").setAttribute("aria-pressed", String(market));
+}
+async function refreshCryptoWallet() {
+  const { data, error } = await supabase.rpc("ping_crypto_wallet");
+  if (error) {
+    $("crypto-miner-status").textContent = "Run the v45 Supabase schema update to choose mining targets.";
+    $("crypto-balance").textContent = "—";
+    $("crypto-pending").textContent = "";
+    return false;
+  }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) return false;
+  cryptoWallet = {
+    balance: Number(row.crypto_balance) || 0,
+    pending: Number(row.pending_crypto) || 0,
+    miningStartedAt: row.mining_started_at || null,
+    ratePerHour: Number(row.rate_per_hour) || 60,
+    capHours: Number(row.cap_hours) || 12,
+    miningLevel: Number(row.mining_level) || 0,
+    boostMinutes: Number(row.boost_minutes) || 0,
+    miningSymbol: row.mining_symbol || "PING"
+  };
+  $("crypto-balance").textContent = cryptoWallet.balance.toLocaleString();
+  $("crypto-pending").textContent = cryptoWallet.miningStartedAt
+    ? `Pending ${cryptoWallet.pending.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${cryptoWallet.miningSymbol} · ${cryptoWallet.ratePerHour.toLocaleString(undefined, { maximumFractionDigits: 4 })}/hour · ${cryptoWallet.capHours}h cap`
+    : "Miner is stopped";
+  $("crypto-miner-status").textContent = cryptoWallet.miningStartedAt
+    ? "Mining " + cryptoWallet.miningSymbol + " · started " + fmtTime(cryptoWallet.miningStartedAt)
+    : "Miner stopped · start a run whenever you like.";
+  $("crypto-mining-symbol").value = cryptoWallet.miningSymbol;
+  $("crypto-rig-level").textContent = `Rig level ${cryptoWallet.miningLevel} / 5`;
+  $("crypto-rate").textContent = `${cryptoWallet.ratePerHour.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${cryptoWallet.miningSymbol} / hour`;
+  $("crypto-boost-time").textContent = cryptoWallet.boostMinutes ? `Boost fuel: ${cryptoWallet.boostMinutes} active min` : "";
+  $("crypto-miner-action").textContent = cryptoWallet.miningStartedAt ? "Claim & keep mining" : "Start mining";
+  $("crypto-miner-action").disabled = !!cryptoWallet.miningStartedAt && cryptoWallet.pending === 0;
+  $("crypto-stop-mining").classList.toggle("hidden", !cryptoWallet.miningStartedAt);
+  const upgradeCost = 100 * (cryptoWallet.miningLevel + 1) ** 2;
+  $("crypto-upgrade-btn").textContent = cryptoWallet.miningLevel >= 5 ? "Miner at max level" : `Upgrade · ${upgradeCost} PING`;
+  $("crypto-upgrade-btn").disabled = cryptoWallet.miningLevel >= 5 || cryptoWallet.balance < upgradeCost;
+  $("crypto-boost-btn").textContent = cryptoWallet.boostMinutes > 420 ? "Use boost fuel first" : "Buy +60 boost min · 75 PING";
+  $("crypto-boost-btn").disabled = cryptoWallet.balance < 75 || cryptoWallet.boostMinutes > 420;
+  $("crypto-convert-btn").disabled = cryptoWallet.balance < 10;
+  return true;
+}
+async function renderBlackmarket() {
+  const itemsBox = $("blackmarket-items"), inventoryBox = $("blackmarket-inventory");
+  itemsBox.replaceChildren(el("p", "Loading encrypted goods…", "muted small"));
+  inventoryBox.replaceChildren();
+  const [catalog, inventory, assets, assetBalances, listings] = await Promise.all([
+    supabase.from("blackmarket_items").select("id,name,description,cost").eq("active", true).order("cost"),
+    supabase.from("blackmarket_inventory").select("item_id,quantity").eq("user_id", profile.id),
+    supabase.from("crypto_assets").select("symbol,name,ping_price,buyback_coins_per_unit,mining_rate_per_hour,marketable")
+      .eq("active", true).eq("marketable", true).order("ping_price"),
+    supabase.from("crypto_asset_balances").select("symbol,balance").eq("user_id", profile.id),
+    supabase.from("crypto_market_listings").select("id,seller_id,seller_username,symbol,amount,ask_ping,created_at")
+      .eq("status", "open").order("created_at", { ascending: false }).limit(50)
+  ]);
+  if (catalog.error || inventory.error || assets.error || assetBalances.error || listings.error) {
+    itemsBox.replaceChildren(el("p", "Run the v45 Supabase schema update to enable mining targets and server buyback.", "muted small"));
+    toast("Black Market data is unavailable. Check the v45 schema update.", "err");
+    return;
+  }
+  cryptoAssetCatalog = assets.data || [];
+  cryptoAssetBalances = new Map((assetBalances.data || []).map((entry) => [entry.symbol, Number(entry.balance) || 0]));
+  renderCryptoAssetHoldings();
+  paintCryptoSellQuote();
+  const owned = new Map((inventory.data || []).map((entry) => [entry.item_id, Number(entry.quantity) || 0]));
+  if (!owned.size) inventoryBox.appendChild(el("p", "Your private inventory is empty.", "muted small"));
+  else {
+    for (const item of catalog.data || []) {
+      const quantity = owned.get(item.id) || 0;
+      if (!quantity) continue;
+      const chip = el("div", null, "blackmarket-inventory-item");
+      chip.append(el("span", item.name), el("strong", "×" + quantity));
+      inventoryBox.appendChild(chip);
+    }
+    if (!inventoryBox.children.length) inventoryBox.appendChild(el("p", "Your private inventory is empty.", "muted small"));
+  }
+  itemsBox.replaceChildren();
+  if (!(catalog.data || []).length) itemsBox.appendChild(el("p", "No goods are available right now.", "muted small"));
+  for (const item of catalog.data || []) {
+    const card = el("article", null, "blackmarket-item");
+    const top = el("div", null, "blackmarket-item-top");
+    top.append(el("h4", item.name), el("span", Number(item.cost).toLocaleString() + " CR", "blackmarket-cost"));
+    card.append(top, el("p", item.description, "muted small"));
+    const count = owned.get(item.id) || 0;
+    const buy = el("button", (count ? "Buy another" : "Buy") + " · " + Number(item.cost).toLocaleString() + " CR", "btn-secondary blackmarket-buy");
+    buy.type = "button";
+    buy.disabled = cryptoWallet.balance < Number(item.cost);
+    buy.onclick = async () => {
+      buy.disabled = true;
+      const { error } = await supabase.rpc("ping_blackmarket_buy", { p_item_id: item.id });
+      if (error) {
+        toast("Purchase failed: " + error.message, "err");
+        buy.disabled = cryptoWallet.balance < Number(item.cost);
+        return;
+      }
+      await refreshCryptoWallet();
+      await renderBlackmarket();
+      toast(item.name + " added to your private inventory.", "ok");
+    };
+    card.appendChild(buy);
+    itemsBox.appendChild(card);
+  }
+  renderCryptoMarketListings(listings.data || []);
+}
+function renderCryptoAssetHoldings() {
+  const box = $("crypto-asset-holdings");
+  box.replaceChildren();
+  for (const asset of cryptoAssetCatalog) {
+    const row = el("div", null, "crypto-asset-holding");
+    row.append(el("span", `${asset.name} · ${asset.symbol}`), el("strong", (cryptoAssetBalances.get(asset.symbol) || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })));
+    box.appendChild(row);
+  }
+}
+function paintCryptoSellQuote() {
+  const asset = cryptoAssetCatalog.find((item) => item.symbol === $("crypto-sell-symbol").value);
+  const amount = normalizeCryptoAmount($("crypto-sell-amount").value);
+  const held = asset ? (cryptoAssetBalances.get(asset.symbol) || 0) : 0;
+  if (!asset || amount === null) {
+    $("crypto-sell-quote").textContent = "Enter an amount";
+    $("crypto-sell-btn").disabled = true;
+    return;
+  }
+  const coins = quoteServerBuybackCoins(amount, asset.buyback_coins_per_unit);
+  if (coins === null) {
+    $("crypto-sell-quote").textContent = "Buyback unavailable";
+    $("crypto-sell-btn").disabled = true;
+    return;
+  }
+  $("crypto-sell-quote").textContent = `${coins.toLocaleString()} coins`;
+  $("crypto-sell-amount").max = String(held);
+  $("crypto-sell-btn").disabled = amount > held || coins < 1;
+}
+function renderCryptoMarketListings(listings) {
+  const box = $("crypto-market-listings");
+  box.replaceChildren();
+  if (!listings.length) { box.appendChild(el("p", "No active player listings yet. Put up the first offer!", "muted small")); return; }
+  for (const listing of listings) {
+    const asset = cryptoAssetCatalog.find((item) => item.symbol === listing.symbol);
+    const row = el("article", null, "crypto-listing-row");
+    const details = el("div", null, "crypto-listing-details");
+    details.append(el("strong", `@${listing.seller_username} · ${Number(listing.amount).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${listing.symbol}`),
+      el("span", `${asset ? asset.name : listing.symbol} · ${fmtTime(listing.created_at)}`, "muted small"));
+    row.appendChild(details);
+    row.appendChild(el("strong", Number(listing.ask_ping).toLocaleString() + " PING", "crypto-listing-price"));
+    const own = listing.seller_id === profile.id;
+    const action = el("button", own ? "Cancel" : "Buy", own ? "mini-btn" : "btn-secondary crypto-listing-buy");
+    action.type = "button";
+    action.disabled = !own && cryptoWallet.balance < Number(listing.ask_ping);
+    action.onclick = async () => {
+      if (!own && action.dataset.confirming !== "true") {
+        action.dataset.confirming = "true";
+        action.textContent = `Confirm ${Number(listing.ask_ping).toLocaleString()} PING`;
+        action.classList.add("confirm-buy");
+        action.title = "Tap again within 5 seconds to confirm this purchase";
+        setTimeout(() => {
+          if (!action.isConnected || action.dataset.confirming !== "true") return;
+          delete action.dataset.confirming;
+          action.textContent = "Buy";
+          action.classList.remove("confirm-buy");
+          action.title = "Buy this listing";
+        }, 5000);
+        return;
+      }
+      action.disabled = true;
+      delete action.dataset.confirming;
+      const { error } = own
+        ? await supabase.rpc("ping_crypto_cancel_listing", { p_listing_id: listing.id })
+        : await supabase.rpc("ping_crypto_buy_listing", { p_listing_id: listing.id });
+      if (error) {
+        toast((own ? "Couldn't cancel listing: " : "Trade failed: ") + error.message, "err");
+        action.disabled = false;
+        return;
+      }
+      await refreshCryptoWallet();
+      await renderBlackmarket();
+      toast(own ? "Listing cancelled and assets returned." : "Trade complete — assets delivered.", "ok");
+    };
+    row.appendChild(action);
+    box.appendChild(row);
+  }
+}
+async function sellCryptoToServer() {
+  const amount = normalizeCryptoAmount($("crypto-sell-amount").value);
+  if (amount === null) {
+    toast("Enter a positive amount with at most 6 decimal places.", "err");
+    return;
+  }
+  const symbol = $("crypto-sell-symbol").value;
+  const { data, error } = await supabase.rpc("ping_crypto_sell_to_server", { p_symbol: symbol, p_amount: amount });
+  if (error) { toast("Server buyback failed: " + error.message, "err"); return; }
+  await refreshCryptoWallet();
+  await renderBlackmarket();
+  updateCoinPill();
+  toast(`Sold ${amount.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${symbol} to the server for ${Number(data) || 0} coins.`, "ok");
+}
+async function createCryptoListing(event) {
+  event.preventDefault();
+  const symbol = $("crypto-list-symbol").value;
+  const amount = normalizeCryptoAmount($("crypto-list-amount").value);
+  const ask = Number($("crypto-list-price").value);
+  if (amount === null || !Number.isSafeInteger(ask) || ask < 1) {
+    toast("Enter an asset amount with up to 6 decimals and a positive PING asking price.", "err");
+    return;
+  }
+  const { error } = await supabase.rpc("ping_crypto_list_asset", { p_symbol: symbol, p_amount: amount, p_ask_ping: ask });
+  if (error) { toast("Couldn't list assets: " + error.message, "err"); return; }
+  $("crypto-list-amount").value = "1";
+  await renderBlackmarket();
+  toast(`${amount.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${symbol} escrowed in your sale listing.`, "ok");
+}
+async function openCryptoMenu(mode = "miner") {
+  const dialog = $("crypto-dialog");
+  setCryptoPanel(mode);
+  if (!dialog.open) dialog.showModal();
+  await refreshCryptoWallet();
+  if (cryptoMenuMode === "market") await renderBlackmarket();
+  clearInterval(cryptoRefreshTimer);
+  cryptoRefreshTimer = setInterval(async () => {
+    if (!dialog.open) return;
+    await refreshCryptoWallet();
+    if (cryptoMenuMode === "market") await renderBlackmarket();
+  }, 30000);
+}
+async function claimCrypto(stopMining = false) {
+  const { data, error } = await supabase.rpc("ping_crypto_claim", { p_stop: !!stopMining });
+  if (error) {
+    toast("Mining claim failed: " + error.message, "err");
+    return;
+  }
+  const amount = Number(data) || 0;
+  const claimed = amount.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  toast(amount ? `Claimed ${claimed} ${cryptoWallet.miningSymbol}${stopMining ? " and stopped the miner" : "; miner continues"}.` : (stopMining ? "Miner stopped." : "No whole asset earned yet."), amount ? "ok" : "");
+  await refreshCryptoWallet();
+}
+async function setCryptoMiningTarget() {
+  const symbol = $("crypto-mining-symbol").value;
+  const { error } = await supabase.rpc("ping_crypto_set_target", { p_symbol: symbol });
+  if (error) {
+    toast("Couldn't change mining target: " + error.message, "err");
+    await refreshCryptoWallet();
+    return;
+  }
+  await refreshCryptoWallet();
+  toast("Mining target set to " + symbol + ". Pending output from the previous target was credited.", "ok");
+}
+function bindCryptoMenus() {
+  const dialog = $("crypto-dialog");
+  $("crypto-close").onclick = () => dialog.close();
+  dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+  dialog.addEventListener("close", () => { clearInterval(cryptoRefreshTimer); cryptoRefreshTimer = null; });
+  $("crypto-tab-miner").onclick = () => setCryptoPanel("miner");
+  $("crypto-tab-market").onclick = async () => {
+    setCryptoPanel("market");
+    await renderBlackmarket();
+  };
+  $("crypto-miner-action").onclick = async () => {
+    if (cryptoWallet.miningStartedAt) { await claimCrypto(false); return; }
+    const { error } = await supabase.rpc("ping_crypto_start_mining");
+    if (error) { toast("Couldn't start mining: " + error.message, "err"); return; }
+    toast("Crypto miner started — it will accrue while you're away.", "ok");
+    await refreshCryptoWallet();
+  };
+  $("crypto-upgrade-btn").onclick = async () => {
+    const { data, error } = await supabase.rpc("ping_crypto_upgrade");
+    if (error) { toast("Miner upgrade failed: " + error.message, "err"); return; }
+    const result = Array.isArray(data) ? data[0] : data;
+    await refreshCryptoWallet();
+    toast(result ? `Miner upgraded to level ${result.rig_level} · ${result.rate_per_hour} PING/hour.` : "Miner upgraded.", "ok");
+  };
+  $("crypto-boost-btn").onclick = async () => {
+    const { data, error } = await supabase.rpc("ping_crypto_buy_boost");
+    if (error) { toast("Miner boost failed: " + error.message, "err"); return; }
+    await refreshCryptoWallet();
+    toast(`Miner boost added ${Number(data) || 0} active minutes.`, "ok");
+  };
+  $("crypto-stop-mining").onclick = () => claimCrypto(true);
+  $("crypto-convert-btn").onclick = async () => {
+    const amount = Number($("crypto-convert-amount").value);
+    if (!Number.isSafeInteger(amount) || amount < 10 || amount % 10 !== 0) {
+      toast("Enter a whole amount of at least 10 Crypto (10 Crypto = 1 coin).", "err");
+      return;
+    }
+    const { data, error } = await supabase.rpc("ping_crypto_convert", { p_crypto: amount });
+    if (error) { toast("Conversion failed: " + error.message, "err"); return; }
+    $("crypto-convert-amount").value = "10";
+    await refreshCryptoWallet();
+    updateCoinPill();
+    toast(`Converted ${amount} Ping Crypto into ${Number(data) || 0} coins.`, "ok");
+  };
+  $("crypto-mining-symbol").addEventListener("change", setCryptoMiningTarget);
+  $("crypto-sell-btn").onclick = sellCryptoToServer;
+  $("crypto-sell-symbol").addEventListener("change", paintCryptoSellQuote);
+  $("crypto-sell-amount").addEventListener("input", paintCryptoSellQuote);
+  $("crypto-listing-form").onsubmit = createCryptoListing;
 }
 
 /* Boosts: level thresholds 2/7/14; cached counts per server. */
@@ -1445,6 +2721,11 @@ async function toggleBoost(s) {
 
 async function loadChannels() {
   if (!activeServer) return;
+  clearTimeout(searchTimer);
+  searchSequence++;
+  $("search-bar").classList.add("hidden");
+  $("search-results").classList.add("hidden");
+  $("search-input").value = "";
   document.body.classList.remove("dm-home");
   $("dm-search-wrap").classList.add("hidden");
   $("extra-nav").classList.add("hidden");
@@ -1961,8 +3242,8 @@ function spoilerMedia(content, label) {
   return wrap;
 }
 
-async function appendMessage(m, live) {
-  if (isBlocked(m.user_id)) return;
+async function appendMessage(m, live, revealBlocked = false) {
+  const blockedMessage = isBlocked(m.user_id) && !revealBlocked;
   if (!users.find((x) => x.id === m.user_id)) await refreshUsers(true);
   if (session && m.user_id === session.user.id) {
     const pendingIndex = pendingMessageNodes.findIndex((item) => item.content === m.content);
@@ -1971,7 +3252,7 @@ async function appendMessage(m, live) {
       pendingMessageNodes.splice(pendingIndex, 1);
     }
   }
-  msgCache.set(m.id, { username: userName(m.user_id), content: m.content });
+  msgCache.set(m.id, { username: userName(m.user_id), content: blockedMessage ? "Blocked message" : m.content });
   const box = $("messages");
   const day = new Date(m.created_at).toDateString();
   if (day !== lastRenderDay) {
@@ -2035,7 +3316,15 @@ async function appendMessage(m, live) {
     main.appendChild(quote);
   }
   const pm = /^\[poll:(\d+)\]/.exec(body);
-  if (pm) {
+  if (blockedMessage) {
+    const hidden = el("div", null, "blocked-message");
+    hidden.appendChild(el("span", "Message hidden · this user is blocked."));
+    const reveal = el("button", "Reveal message", "mini-btn");
+    reveal.type = "button";
+    reveal.onclick = () => { row.remove(); appendMessage(m, false, true); };
+    hidden.appendChild(reveal);
+    main.appendChild(hidden);
+  } else if (pm) {
     const pc = el("div", null, "poll-card");
     pc.dataset.pollCard = pm[1];
     main.appendChild(pc);
@@ -2423,12 +3712,16 @@ async function reportMessage(message) {
   toast("Report sent to the Ping moderation team.", "ok");
 }
 
+let memberRenderSequence = 0;
 async function refreshUsers(quiet) {
+  const sequence = ++memberRenderSequence;
+  const context = { type: view.type, uid: view.uid, thread: view.thread, serverId: activeServer && activeServer.id };
   hideBadgeTooltip();
   const [profileResult, badgeResult] = await Promise.all([
     supabase.from("profiles").select("*").order("username"),
     supabase.from("profile_badges").select("user_id,badge_id").order("created_at")
   ]);
+  if (sequence !== memberRenderSequence) return;
   users = profileResult.data || [];
   userBadges = new Map();
   for (const row of badgeResult.data || []) {
@@ -2447,14 +3740,24 @@ async function refreshUsers(quiet) {
     paintUserPanelAvatar();
   }
   const list = $("members-list");
-  list.innerHTML = "";
   let online = 0;
-  const admins = users.filter((u) => u.role === "admin");
-  const members = users.filter((u) => u.role !== "admin");
-  for (const group of [["ADMIN", admins], ["MEMBERS", members]]) {
-    if (!group[1].length) continue;
-    list.appendChild(el("div", group[0] + " — " + group[1].length, "members-title"));
-    for (const u of group[1]) {
+  let sidebarUsers = [];
+  if (context.type === "channel" && context.serverId) {
+    const { data: roster } = await supabase.from("server_members").select("user_id").eq("server_id", context.serverId).limit(1000);
+    const memberIds = new Set((roster || []).map((row) => row.user_id));
+    sidebarUsers = users.filter((user) => memberIds.has(user.id));
+  } else if (context.type === "dm" && context.uid) {
+    sidebarUsers = users.filter((user) => user.id === context.uid);
+  } else if (context.type === "gdm" && context.thread) {
+    const { data: roster } = await supabase.from("dm_group_members").select("user_id").eq("thread_id", context.thread).limit(20);
+    const memberIds = new Set((roster || []).map((row) => row.user_id));
+    sidebarUsers = users.filter((user) => memberIds.has(user.id));
+  }
+  if (sequence !== memberRenderSequence) return;
+  // Clear after async roster loading so overlapping refreshes cannot append
+  // duplicate ADMIN/MEMBERS or conversation-member lists.
+  list.replaceChildren();
+  const renderMember = (u) => {
       const status = presenceStatusForUser(u);
       const isOnline = status !== "offline";
       if (isOnline) online++;
@@ -2475,13 +3778,67 @@ async function refreshUsers(quiet) {
       if (roleColor) row.querySelector(".member-name").style.color = roleColor;
       const custom = (u.custom_status || "").trim().slice(0, 60);
       if (custom) row.appendChild(el("span", custom, "member-status"));
+      const activity = richPresenceNode(u, true);
+      if (activity) { row.classList.add("member-has-rich-presence"); row.appendChild(activity); }
       if (u.is_muted) row.appendChild(el("span", "Muted", "member-state"));
       if (u.is_banned) row.appendChild(el("span", "Banned", "member-state"));
       list.appendChild(row);
+  };
+  if (context.type === "dm" && context.uid) {
+    const u = sidebarUsers[0];
+    if (u) {
+      list.appendChild(el("div", "DIRECT MESSAGE", "members-title"));
+      const profileCard = el("div", null, "dm-member-profile-card");
+      profileCard.setAttribute("role", "button");
+      profileCard.setAttribute("tabindex", "0");
+      profileCard.setAttribute("aria-label", "View " + u.username + "'s profile");
+      profileCard.title = "Open profile";
+      profileCard.onclick = (event) => { if (!event.target.closest("button")) openProfile(u.id); };
+      profileCard.onkeydown = (event) => {
+        if ((event.key === "Enter" || event.key === " ") && event.target === profileCard) { event.preventDefault(); openProfile(u.id); }
+      };
+      const cover = el("div", null, "dm-member-cover");
+      paintProfileCover(cover, u);
+      profileCard.appendChild(cover);
+      const identity = el("div", null, "dm-member-identity");
+      identity.appendChild(avatarNode(u.username, u.avatar_emoji, u.equipped || {}, u.avatar_url));
+      const details = el("div", null, "dm-member-details");
+      const title = el("div", u.username, "dm-name");
+      applyNameplate(title, u.equipped || {});
+      details.appendChild(title);
+      details.appendChild(el("div", "@" + u.username, "muted small"));
+      const presence = presenceStatusForUser(u);
+      details.appendChild(el("div", u.custom_status || presenceLabel(presence), "muted small dm-member-status"));
+      identity.appendChild(details);
+      profileCard.appendChild(identity);
+      const activity = richPresenceNode(u, true);
+      if (activity) profileCard.appendChild(activity);
+      if (u.bio) {
+        const about = el("div", null, "dm-member-about");
+        about.append(el("div", "ABOUT ME", "profile-section-title"), el("div", u.bio, "small"));
+        profileCard.appendChild(about);
+      }
+      profileCard.appendChild(el("div", "Member since " + new Date(u.created_at).toLocaleDateString(), "muted small dm-member-since"));
+      const viewProfile = el("button", "View Full Profile", "btn-secondary dm-full-profile");
+      viewProfile.type = "button"; viewProfile.onclick = (event) => { event.stopPropagation(); openProfile(u.id); };
+      profileCard.appendChild(viewProfile);
+      list.appendChild(profileCard);
+      online = isOnline ? 1 : 0;
+    }
+  } else if (context.type === "gdm") {
+    list.appendChild(el("div", "GROUP MEMBERS — " + sidebarUsers.length, "members-title"));
+    sidebarUsers.forEach(renderMember);
+  } else if (context.type === "channel") {
+    const admins = sidebarUsers.filter((user) => user.role === "admin");
+    const members = sidebarUsers.filter((user) => user.role !== "admin");
+    for (const group of [["ADMIN", admins], ["MEMBERS", members]]) {
+      if (!group[1].length) continue;
+      list.appendChild(el("div", group[0] + " — " + group[1].length, "members-title"));
+      group[1].forEach(renderMember);
     }
   }
   $("members-online").textContent = online;
-  $("member-count").textContent = users.length + " members";
+  $("member-count").textContent = (context.type === "dm" && context.uid ? "1 member" : sidebarUsers.length + " members");
   if (!quiet) return;
 }
 
@@ -2644,6 +4001,12 @@ if (CONFIGURED) {
     const input = $("message-input");
     const text = input.value.trim();
     if (!text) return;
+    if (/^\/(blackmarket|crypto)$/i.test(text)) {
+      input.value = "";
+      hideAdminCommandPicker();
+      await openCryptoMenu(text.toLowerCase() === "/blackmarket" ? "market" : "miner");
+      return;
+    }
     if (view.type === "channel" && text.startsWith("/")) {
       const commandResult = await executeAdminCommand(text);
       if (commandResult !== "not-command") {
@@ -2721,13 +4084,19 @@ if (CONFIGURED) {
     }
   };
 
+  bindServerFolderManager();
+  bindQuickSwitcher();
+  bindCryptoMenus();
   $("add-server-btn").onclick = async () => {
     const name = await showModal({ title: "Create server", body: "New servers are private — invite people with a link.", input: true, placeholder: "Server name", okText: "Create" });
     if (!name) return;
-    const { data, error } = await supabase.from("servers")
-      .insert({ name: name.slice(0, 40), created_by: profile.id }).select().single();
-    if (error) { toast("Couldn't create server: " + error.message, "err"); return; }
-    await supabase.from("channels").insert({ server_id: data.id, name: "general", topic: "" });
+    const { data: serverId, error } = await supabase.rpc("create_server_with_general", { p_name: name.slice(0, 40) });
+    if (error) {
+      toast("Couldn't create server: " + (error.message || "Run the latest supabase-schema.sql (v38) and try again."), "err");
+      return;
+    }
+    const { data, error: fetchError } = await supabase.from("servers").select("*").eq("id", serverId).single();
+    if (fetchError || !data) { toast("Server was created, but couldn't load it: " + (fetchError && fetchError.message), "err"); return; }
     await logActivity("server_create", name.trim().slice(0, 40));
     servers.push(data);
     activeServer = data;
@@ -2748,8 +4117,20 @@ if (CONFIGURED) {
   $("search-btn").onclick = () => {
     const bar = $("search-bar");
     bar.classList.toggle("hidden");
-    if (!bar.classList.contains("hidden")) $("search-input").focus();
-    else $("search-results").classList.add("hidden");
+    if (!bar.classList.contains("hidden")) {
+      paintSearchScope();
+      $("search-input").focus();
+    } else {
+      searchSequence++;
+      clearTimeout(searchTimer);
+      $("search-results").classList.add("hidden");
+    }
+  };
+  $("search-scope-btn").onclick = () => {
+    clearTimeout(searchTimer);
+    searchMessageAllServers = !searchMessageAllServers;
+    paintSearchScope();
+    runSearch($("search-input").value.trim());
   };
   $("search-input").addEventListener("input", () => {
     clearTimeout(searchTimer);
@@ -2794,20 +4175,12 @@ if (CONFIGURED) {
   $("voice-fullscreen").onclick = toggleVoiceFullscreen;
   $("voice-dock-return").onclick = () => showView("voice-view");
   $("voice-dock-hangup").onclick = () => leaveVoice(false);
+  $("voice-dock-mute").onclick = toggleVoiceMute;
+  $("voice-dock-deafen").onclick = toggleVoiceDeafen;
   $("screen-mini-return").onclick = () => showView("voice-view");
   $("screen-mini-stop").onclick = closeScreenMini;
-  $("voice-mute").onclick = async () => {
-    voiceMuted = !voiceMuted;
-    if (localStream) for (const t of localStream.getAudioTracks()) t.enabled = !voiceMuted;
-    await updateVoicePresence();
-    paintVoiceButtons();
-  };
-  $("voice-deafen").onclick = async () => {
-    voiceDeaf = !voiceDeaf;
-    for (const [, e] of voicePcs) if (e.audio) e.audio.muted = voiceDeaf;
-    await updateVoicePresence();
-    paintVoiceButtons();
-  };
+  $("voice-mute").onclick = toggleVoiceMute;
+  $("voice-deafen").onclick = toggleVoiceDeafen;
   $("voice-leave").onclick = () => leaveVoice(false);
 
   $("logout-btn").onclick = async () => {    await logActivity("logout", "");
@@ -2873,12 +4246,17 @@ if (CONFIGURED) {
     }
     const editingField = target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k"
-        && !$("app-view").classList.contains("hidden")
-        && $("modal-overlay").classList.contains("hidden")) {
-      event.preventDefault();
-      if (view.type !== "dm") enterHome().then(() => $("dm-search").focus());
-      else $("dm-search").focus();
-      return;
+        && !$("app-view").classList.contains("hidden")) {
+      if ($("quick-switcher-dialog").open) {
+        event.preventDefault();
+        $("quick-switcher-dialog").close();
+        return;
+      }
+      if ($("modal-overlay").classList.contains("hidden") && !$("server-folder-dialog").open) {
+        event.preventDefault();
+        openQuickSwitcher();
+        return;
+      }
     }
     if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey
         && !editingField && !$("app-view").classList.contains("hidden")
@@ -2907,8 +4285,25 @@ if (CONFIGURED) {
   $("user-role-filter").addEventListener("change", renderDashboardUsers);
   $("user-state-filter").addEventListener("change", renderDashboardUsers);
   $("activity-filter").addEventListener("change", renderDashboardActivity);
+  $("audit-search").addEventListener("input", renderDashboardActivity);
+  $("audit-from").addEventListener("change", renderDashboardActivity);
+  $("audit-through").addEventListener("change", renderDashboardActivity);
+  $("activity-export").onclick = exportAuditCsv;
+  $("activity-load-more").onclick = loadOlderAuditEvents;
   $("report-state-filter").addEventListener("change", renderReportQueue);
   $("grant-currency-submit").onclick = grantCurrencyFromDashboard;
+  $("grant-currency-direction").addEventListener("change", () => {
+    $("grant-currency-submit").textContent = $("grant-currency-direction").value === "remove" ? "Take away coins" : "Give coins";
+  });
+  $("crypto-grant-submit").onclick = grantCryptoFromDashboard;
+  $("crypto-grant-direction").addEventListener("change", () => {
+    $("crypto-grant-submit").textContent = $("crypto-grant-direction").value === "remove" ? "Take away asset" : "Give asset";
+  });
+  $("crypto-grant-kind").addEventListener("change", () => {
+    const integer = ["PING", "BOOST", "RIG"].includes($("crypto-grant-kind").value);
+    $("crypto-grant-amount").step = integer ? "1" : "0.000001";
+    $("crypto-grant-amount").min = integer ? "1" : "0.000001";
+  });
   $("admin-open-games").onclick = openGames;
   $("dash-open-public").onclick = async () => {
     const publicServer = servers.find((server) => server.name.toLowerCase() === "ping public chat");
@@ -3994,6 +5389,7 @@ function openSettings(draft = null) {
   checkRow("Direct message alerts", () => uiSettings.dmNotifications, (v) => uiSettings.dmNotifications = v);
   checkRow("In-app alerts", () => uiSettings.inAppNotifications, (v) => uiSettings.inAppNotifications = v);
   checkRow("Desktop notifications", () => uiSettings.desktopNotifications, (v) => uiSettings.desktopNotifications = v, { desktopPermission: true });
+  appendRichPresenceSettings(body);
 
   body.appendChild(el("div", "PROFILE", "chan-group"));
   const editProfile = el("button", "✎ Edit full profile", "btn-secondary profile-settings-edit");
@@ -4266,12 +5662,14 @@ function dayStartISO() {
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
 async function myWallet() {
-  const [own, grants, itemGrants] = await Promise.all([
+  const [own, grants, itemGrants, dailyQuestClaims] = await Promise.all([
     supabase.from("activity_log").select("action,detail,created_at").eq("user_id", session.user.id).limit(2000),
     supabase.from("activity_log").select("action,detail,created_at").eq("action", "coin_grant")
       .like("detail", `grant:${escapeLike(profile.username)}:%`).limit(200),
     supabase.from("activity_log").select("action,detail,created_at").eq("action", "item_grant")
-      .like("detail", `item:${escapeLike(profile.username)}:%`).limit(200)
+      .like("detail", `item:${escapeLike(profile.username)}:%`).limit(200),
+    supabase.from("activity_log").select("detail").eq("user_id", session.user.id).eq("action", "quest_claim")
+      .gte("created_at", dayStartISO()).limit(100)
   ]);
   let balance = 0;
   const owned = new Set(), claimsToday = new Set();
@@ -4289,6 +5687,8 @@ async function myWallet() {
       if (m[1] === "nitro_basic" || m[1] === "boost_basic") { nitroUntil = Math.max(nitroUntil, Date.parse(created) + 7 * 864e5); nitroBuys++; }
     } else if (action === "coin_grant" && (m = /grant:[^:]+:\+(\d+)/.exec(detail))) {
       balance += +m[1];
+    } else if (action === "coin_admin_remove" && (m = /^remove:[^:]+:-(\d+)$/.exec(detail))) {
+      balance -= +m[1];
     } else if (action === "coin_gift_send" && (m = /gift:[^:]+:-(\d+)/.exec(detail))) {
       balance -= +m[1];
     } else if (action === "item_grant" && (m = /^item:[^:]+:([^:]+)$/.exec(detail))) {
@@ -4300,6 +5700,12 @@ async function myWallet() {
   for (const r of (own.data || []).filter((r) => r.action !== "coin_grant")) eat(r.action, r.detail, r.created_at);
   for (const r of grants.data || []) eat(r.action, r.detail, r.created_at);
   for (const r of itemGrants.data || []) eat(r.action, r.detail, r.created_at);
+  // Query today's claims independently of the bounded lifetime ledger scan so
+  // daily quests reliably reset at midnight UTC for long-lived accounts.
+  for (const row of dailyQuestClaims.data || []) {
+    const match = /^quest:([^:]+):\+\d+$/.exec(row.detail || "");
+    if (match) claimsToday.add(match[1]);
+  }
   if (session) nitroTiers.set(session.user.id, nitroTierForBuys(nitroBuys));
   return { balance, owned, claimsToday, nitroUntil, nitroActive: nitroUntil > Date.now(), nitroBuys };
 }
@@ -4510,21 +5916,25 @@ async function renderGames() {
   const scrambleBest = Math.max(0, ...rows.filter((x) => x.game_id === "scramble").map((x) => Number(x.score)));
   const wordleWins = rows.filter((x) => x.game_id === "wordle" && x.result === "win").length;
   const minesWins = rows.filter((x) => x.game_id === "minesweeper" && x.result === "win").length;
+  const memoryBest = Math.max(0, ...rows.filter((x) => x.game_id === "memory").map((x) => Number(x.score)));
   content.classList.remove("hidden");
-  content.appendChild(el("div", "Your account stats · " + wins + " Tic-Tac-Toe wins · best reaction " + best + " · best scramble " + scrambleBest + " · " + wordleWins + " Wordle solves · " + minesWins + " Minesweeper clears", "games-intro muted small"));
+  content.appendChild(el("div", "Your account stats · " + wins + " Tic-Tac-Toe wins · best reaction " + best + " · best scramble " + scrambleBest + " · " + wordleWins + " Wordle solves · " + minesWins + " Minesweeper clears · best Memory Match " + memoryBest, "games-intro muted small"));
   const grid = el("div", null, "games-grid");
   grid.appendChild(makeTicTacToeCard());
   grid.appendChild(makeQuickdrawCard());
   grid.appendChild(makeWordScrambleCard());
   grid.appendChild(makeWordleCard());
   grid.appendChild(makeMinesCard());
+  grid.appendChild(makeMemoryMatchCard());
   content.appendChild(grid);
   const history = rows.slice(0, 8);
   const historyCard = el("div", null, "game-card game-history");
   historyCard.appendChild(el("h3", "Recent activity"));
   if (!history.length) historyCard.appendChild(el("div", "Your game results will show here.", "muted small"));
   for (const row of history) {
-    const label = row.game_id === "quickdraw"
+    const label = row.game_id === "memory"
+      ? "Memory Match · " + row.score + " points"
+      : row.game_id === "quickdraw"
       ? "Quickdraw · " + row.score + " ms"
       : row.game_id === "scramble"
         ? "Word Scramble · " + row.score + " points"
@@ -4941,16 +6351,128 @@ function makeMinesCard() {
   return card;
 }
 
+function makeMemoryMatchCard() {
+  const card = el("section", null, "game-card memory-game-card");
+  const head = el("div", null, "game-card-top");
+  head.append(el("h3", "Memory Match"), el("span", "4×4 · 8 PAIRS", "game-badge"));
+  card.appendChild(head);
+  card.appendChild(el("p", "Flip two cards at a time and find every matching emoji pair.", "muted small"));
+  const board = el("div", null, "memory-board");
+  board.setAttribute("aria-label", "Memory Match cards");
+  const status = el("div", "Press Start game to shuffle the cards.", "game-status memory-status");
+  const start = el("button", "Start game", "btn-primary memory-start");
+  start.type = "button";
+  let deck = [], moves = 0, matchedPairs = 0, selected = [];
+  let playing = false, locked = false, startedAt = 0, elapsedSeconds = 0, timer = null, flipTimer = null, round = 0;
+  let note = "";
+  const elapsed = () => playing ? Math.floor((Date.now() - startedAt) / 1000) : elapsedSeconds;
+  const paintStatus = () => {
+    const minutes = Math.floor(elapsed() / 60), seconds = String(elapsed() % 60).padStart(2, "0");
+    const progress = `${matchedPairs}/${MEMORY_SYMBOLS.length} pairs · ${moves} moves · ${minutes}:${seconds}`;
+    status.textContent = note ? progress + " · " + note : progress;
+  };
+  const paintBoard = () => {
+    board.replaceChildren();
+    deck.forEach((entry, index) => {
+      const revealed = entry.revealed || entry.matched;
+      const tile = el("button", revealed ? entry.symbol : "✦", "memory-tile" + (revealed ? " revealed" : "") + (entry.matched ? " matched" : ""));
+      tile.type = "button";
+      tile.disabled = !playing || locked || entry.matched || entry.revealed;
+      tile.setAttribute("aria-pressed", String(revealed));
+      tile.setAttribute("aria-label", entry.matched ? `Card ${index + 1}, matched ${entry.symbol}` : revealed ? `Card ${index + 1}, ${entry.symbol}` : `Card ${index + 1}, face down`);
+      tile.onclick = () => {
+        if (!playing || locked || entry.matched || entry.revealed) return;
+        entry.revealed = true;
+        selected.push(index);
+        if (selected.length === 2) {
+          moves++;
+          const [firstIndex, secondIndex] = selected;
+          const first = deck[firstIndex], second = deck[secondIndex];
+          if (first.pair === second.pair) {
+            first.matched = second.matched = true;
+            matchedPairs++;
+            selected = [];
+            note = "Pair found!";
+            paintBoard();
+            paintStatus();
+            if (matchedPairs === MEMORY_SYMBOLS.length) finish();
+            return;
+          }
+          locked = true;
+          note = "Not a match — remember their spots.";
+          paintBoard();
+          paintStatus();
+          const currentRound = round;
+          flipTimer = setTimeout(() => {
+            if (currentRound !== round) return;
+            first.revealed = second.revealed = false;
+            selected = [];
+            locked = false;
+            note = "Keep going!";
+            paintBoard();
+            paintStatus();
+          }, 750);
+          return;
+        }
+        note = "Find its pair.";
+        paintBoard();
+        paintStatus();
+      };
+      board.appendChild(tile);
+    });
+  };
+  const finish = () => {
+    elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+    playing = false;
+    clearInterval(timer);
+    timer = null;
+    clearTimeout(flipTimer);
+    flipTimer = null;
+    card.classList.add("memory-won");
+    note = `All pairs found! 🎉 +${memoryMatchScore(moves, elapsedSeconds)} points.`;
+    start.textContent = "Play again";
+    paintBoard();
+    paintStatus();
+    saveGameScore("memory", memoryMatchScore(moves, elapsedSeconds), "win");
+  };
+  start.onclick = () => {
+    clearInterval(timer);
+    clearTimeout(flipTimer);
+    round++;
+    card.classList.remove("memory-won");
+    deck = makeMemoryDeck();
+    moves = 0;
+    matchedPairs = 0;
+    selected = [];
+    playing = true;
+    locked = false;
+    startedAt = Date.now();
+    elapsedSeconds = 0;
+    note = "Find all eight pairs!";
+    start.textContent = "Restart round";
+    paintBoard();
+    paintStatus();
+    timer = setInterval(paintStatus, 1000);
+  };
+  card.append(board, status, start);
+  return card;
+}
+
 async function saveGameScore(gameId, score, result) {
   const { error } = await supabase.from("game_scores").insert({
     user_id: profile.id, game_id: gameId, score, result
   });
-  if (error) toast("Score wasn't saved: " + error.message, "err");
+  if (error) toast(error.code === "23514" ? "Run the v40 Supabase schema upgrade to save this game's score." : "Score wasn't saved: " + error.message, "err");
 }
 
 /* main-column views (chat / dashboard / shop / quests / games / voice) */
 function showView(id) {
   setMobileNav(false);
+  if (id !== "quests-view") {
+    if (questResetTimer) clearTimeout(questResetTimer);
+    if (questCountdownTimer) clearInterval(questCountdownTimer);
+    questResetTimer = questCountdownTimer = null;
+  }
   if (id !== "chat-view" || view.type !== "channel") {
     document.querySelectorAll(".server-banner").forEach((node) => node.remove());
   }
@@ -5354,7 +6876,26 @@ async function openQuests() {
   showView("quests-view");
   await renderQuests();
 }
+let questResetTimer = null, questCountdownTimer = null;
+function updateQuestResetCountdown() {
+  const label = $("quest-reset-countdown");
+  if (!label) return;
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const seconds = Math.max(0, Math.floor((next.getTime() - now.getTime()) / 1000));
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60);
+  label.textContent = `Resets in ${hours}h ${String(minutes).padStart(2, "0")}m · midnight UTC`;
+}
 async function renderQuests() {
+  if (questResetTimer) clearTimeout(questResetTimer);
+  if (questCountdownTimer) clearInterval(questCountdownTimer);
+  updateQuestResetCountdown();
+  questCountdownTimer = setInterval(updateQuestResetCountdown, 60_000);
+  const now = new Date();
+  const nextReset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).getTime();
+  questResetTimer = setTimeout(() => {
+    if (!document.getElementById("quests-view").classList.contains("hidden")) renderQuests();
+  }, Math.max(1000, nextReset - now.getTime() + 100));
   const list = $("quests-list");
   list.innerHTML = '<div class="skel"></div><div class="skel"></div>';
   const w = await myWallet();
@@ -5394,7 +6935,19 @@ async function renderQuests() {
     btn.disabled = claimed || !complete;
     if (!claimed && complete) {
       btn.onclick = async () => {
-        await logActivity("quest_claim", `quest:${q.id}:+${q.reward}`);
+        btn.disabled = true;
+        const latest = await myWallet();
+        if (!q.once && latest.claimsToday.has(q.id)) {
+          toast("This daily quest was already claimed. It resets at midnight UTC.", "err");
+          await renderQuests();
+          return;
+        }
+        const { error } = await logActivity("quest_claim", `quest:${q.id}:+${q.reward}`);
+        if (error) {
+          btn.disabled = false;
+          toast("Couldn't claim quest: " + error.message, "err");
+          return;
+        }
         toast(`+${q.reward} 🪙 ${q.name}!`, "ok");
         renderQuests();
       };
@@ -5525,11 +7078,19 @@ async function showPinsRich() {
 }
 
 async function jumpToMessage(channelId, mid) {
-  if (!activeChannel || activeChannel.id !== channelId) {
-    const ch = channels.find((c) => c.id === channelId);
-    if (!ch) return;
-    await selectChannel(channelId);
+  let target = channels.find((channel) => String(channel.id) === String(channelId));
+  if (!target || !activeServer || String(target.server_id) !== String(activeServer.id)) {
+    const { data, error } = await supabase.from("channels").select("*").eq("id", channelId).maybeSingle();
+    if (error || !data) { toast("That message's channel is no longer available.", "err"); return; }
+    const destination = servers.find((server) => String(server.id) === String(data.server_id));
+    if (!destination) { toast("You no longer have access to that server.", "err"); return; }
+    activeServer = destination;
+    activeChannel = null;
+    await loadChannels();
+    target = channels.find((channel) => String(channel.id) === String(channelId));
   }
+  if (!target) { toast("That message's channel is no longer available.", "err"); return; }
+  if (!activeChannel || String(activeChannel.id) !== String(channelId)) await selectChannel(target.id);
   for (let tries = 0; tries < 3; tries++) {
     const node = document.querySelector(`.msg[data-mid="${mid}"]`);
     if (node) {
@@ -5544,27 +7105,69 @@ async function jumpToMessage(channelId, mid) {
 }
 
 let searchTimer = null;
+let searchSequence = 0;
+let searchMessageAllServers = true;
+function paintSearchScope() {
+  const button = $("search-scope-btn");
+  button.textContent = searchMessageAllServers ? "All servers" : "This server";
+  button.title = searchMessageAllServers ? "Search all servers you can access" : "Search only " + (activeServer ? activeServer.name : "this server");
+  button.setAttribute("aria-pressed", String(searchMessageAllServers));
+  $("search-input").placeholder = searchMessageAllServers ? "Search messages across servers…" : "Search this server…";
+}
 async function runSearch(q) {
+  const request = ++searchSequence;
   const box = $("search-results");
   if (!q || !activeServer) { box.classList.add("hidden"); return; }
-  const { data: chs } = await supabase.from("channels").select("id,name").eq("server_id", activeServer.id).limit(50);
-  const ids = (chs || []).map((c) => c.id);
-  if (!ids.length) return;
-  const { data } = await supabase.from("messages").select("id,content,created_at,user_id,channel_id")
-    .in("channel_id", ids).ilike("content", `%${q.replace(/[%_]/g, "")}%`)
+  const term = q.replace(/[%_\\]/g, "").trim();
+  if (!term) { box.classList.add("hidden"); return; }
+  const isStaff = profile && (profile.role === "admin" || profile.role === "mod");
+  const searchServers = searchMessageAllServers
+    ? servers.filter((server) => isStaff || server.created_by === session.user.id || isMember(server.id))
+    : [activeServer];
+  if (!searchServers.length) {
+    box.replaceChildren(el("div", "No accessible servers to search.", "muted small"));
+    box.classList.remove("hidden");
+    return;
+  }
+  box.replaceChildren(el("div", "Searching messages…", "muted small search-loading"));
+  box.classList.remove("hidden");
+  const { data: chs, error: channelsError } = await supabase.from("channels")
+    .select("id,name,server_id").in("server_id", searchServers.map((server) => server.id)).order("id", { ascending: false }).limit(1000);
+  if (request !== searchSequence) return;
+  if (channelsError) {
+    box.replaceChildren(el("div", "Couldn't search channels: " + channelsError.message, "muted small"));
+    return;
+  }
+  const ids = (chs || []).map((channel) => channel.id);
+  if (!ids.length) {
+    box.replaceChildren(el("div", "No channels available to search.", "muted small"));
+    return;
+  }
+  const { data, error } = await supabase.from("messages").select("id,content,created_at,user_id,channel_id")
+    .in("channel_id", ids).ilike("content", `%${term}%`)
     .order("id", { ascending: false }).limit(20);
-  box.innerHTML = "";
+  if (request !== searchSequence) return;
+  if (error) {
+    box.replaceChildren(el("div", "Couldn't search messages: " + error.message, "muted small"));
+    return;
+  }
+  box.replaceChildren();
   if (!(data || []).length) box.appendChild(el("div", "No matches.", "muted small"));
-  const cmap = new Map((chs || []).map((c) => [c.id, c.name]));
-  for (const m of data || []) {
+  const channelById = new Map((chs || []).map((channel) => [channel.id, channel]));
+  const serverById = new Map(searchServers.map((server) => [String(server.id), server]));
+  for (const message of data || []) {
     const row = el("button", null, "search-row");
     row.type = "button";
-    row.appendChild(el("div", `#${cmap.get(m.channel_id) || "?"} · ${userName(m.user_id)} · ${fmtTime(m.created_at)}`, "muted small"));
-    row.appendChild(el("div", String(m.content).slice(0, 110)));
+    const channel = channelById.get(message.channel_id);
+    const server = channel && serverById.get(String(channel.server_id));
+    const location = [server && server.name, channel && "#" + channel.name, userName(message.user_id), fmtTime(message.created_at)].filter(Boolean).join(" · ");
+    row.appendChild(el("div", location, "muted small"));
+    row.appendChild(el("div", String(message.content).slice(0, 110)));
     row.onclick = () => {
       box.classList.add("hidden");
       $("search-bar").classList.add("hidden");
-      jumpToMessage(m.channel_id, m.id);
+      searchSequence++;
+      jumpToMessage(message.channel_id, message.id);
     };
     box.appendChild(row);
   }
@@ -5686,6 +7289,8 @@ function openSelfCard() {
   details.appendChild(statusLine);
   identity.appendChild(details);
   body.appendChild(identity);
+  const ownRichPresence = richPresenceProfileBlock(u);
+  body.appendChild(ownRichPresence);
   renderConnectionBadges(body, u, true);
   if (u.bio) {
     const bioBox = el("div", null, "profile-info-box self-bio-box");
@@ -5852,6 +7457,8 @@ function openProfile(uid) {
   renderConnectionBadges(details, u, false);
   identity.appendChild(details);
   body.appendChild(identity);
+  const activity = richPresenceProfileBlock(u);
+  body.appendChild(activity);
 
   // Discord-style inset info box: about, member-since.
   // (Badges live next to the name above — no duplicate row here.)
@@ -6151,7 +7758,10 @@ async function renderPollCard(container, pollId) {
 }
 
 async function paintPollVotes(poll, scope) {
-  const nodes = (scope || document).querySelectorAll(`[data-poll-card="${poll.id}"]`);
+  const selector = `[data-poll-card="${poll.id}"]`;
+  const nodes = scope
+    ? [...(scope.matches && scope.matches(selector) ? [scope] : []), ...scope.querySelectorAll(selector)]
+    : [...document.querySelectorAll(selector)];
   if (!nodes.length) return;
   const { data } = await supabase.from("poll_votes").select("user_id,option_idx")
     .eq("poll_id", poll.id).limit(2000);
@@ -6456,6 +8066,7 @@ async function openGroupDM(threadId) {
   paintDmUnread();
   activeServer = null;
   activeChannel = null;
+  await refreshUsers(true);
   document.querySelectorAll(".server-banner").forEach((node) => node.remove());
   loadServerEmoji();
   if (msgChannel) { await supabase.removeChannel(msgChannel); msgChannel = null; }
@@ -6470,6 +8081,7 @@ async function openGroupDM(threadId) {
   const names = (members || [])
     .map((m) => users.find((x) => x.id === m.user_id))
     .filter(Boolean).map((u) => u.username);
+  $("member-count").textContent = `${(members || []).length} members`;
   $("channel-hash").textContent = "👥";
   const headerAvatar = $("dm-header-avatar");
   const groupAvatar = el("span", null, "avatar group-avatar");
@@ -7214,6 +8826,7 @@ function ensureDmSub() {
 }
 
 async function enterHome() {
+  const homeSequence = ++dmOpenSequence;
   setMobileNav(false);
   view = { type: "dm", uid: null };
   showView("chat-view");
@@ -7229,12 +8842,16 @@ async function enterHome() {
   $("channel-name").onkeydown = null;
   activeServer = null;
   activeChannel = null;
+  await refreshUsers(true);
+  if (homeSequence !== dmOpenSequence || view.type !== "dm" || view.uid !== null) return;
   document.querySelectorAll(".server-banner").forEach((n) => n.remove());
   loadServerEmoji();
   if (msgChannel) { await supabase.removeChannel(msgChannel); msgChannel = null; }
   renderServerRail();
   $("server-header").textContent = "Direct Messages";
+  $("member-count").textContent = "0 members";
   await renderDmList(true);
+  if (homeSequence !== dmOpenSequence || view.type !== "dm" || view.uid !== null) return;
   const box = $("messages");
   box.innerHTML = "";
   const welcome = el("section", null, "dm-home-empty");
@@ -7300,6 +8917,16 @@ function renderHomeNav(list) {
 }
 async function renderDmList(refresh = true) {
   const list = $("channel-list");
+  if (!list.dataset.dmNavigationBound) {
+    list.dataset.dmNavigationBound = "true";
+    list.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-open-dm]");
+      if (!target || !list.contains(target)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      openDM(target.dataset.openDm);
+    }, true);
+  }
   list.innerHTML = "";
   const search = $("dm-search").value.trim().toLowerCase();
   if (search || peopleDirectoryOpen) {
@@ -7313,8 +8940,10 @@ async function renderDmList(refresh = true) {
       avatarButton.setAttribute("aria-label", "View " + u.username + "'s profile");
       avatarButton.appendChild(avatarNode(u.username, u.avatar_emoji, u.equipped || {}, u.avatar_url));
       avatarButton.onclick = () => openProfile(u.id);
+      row.onclick = (event) => { if (!event.target.closest(".dm-avatar-button")) openDM(u.id); };
       const start = el("button", null, "dm-thread dm-thread-copy");
       start.type = "button";
+      start.onclick = (event) => { event.stopPropagation(); openDM(u.id); };
       const meta = el("span", null, "dm-meta");
       const title = el("span", null, "dm-title-line");
       title.appendChild(el("span", u.username, "dm-name"));
@@ -7326,7 +8955,6 @@ async function renderDmList(refresh = true) {
       const online = presence !== "offline";
       meta.appendChild(el("span", online ? presenceLabel(presence) + " · Start a conversation" : "Start a conversation", "muted small"));
       start.appendChild(meta);
-      start.onclick = () => openDM(u.id);
       row.append(avatarButton, start);
       list.appendChild(row);
     }
@@ -7365,9 +8993,11 @@ async function renderDmList(refresh = true) {
     avatarButton.type = "button";
     avatarButton.setAttribute("aria-label", "View " + name + "'s profile");
     avatarButton.appendChild(avatarNode(name, u && u.avatar_emoji, (u && u.equipped) || {}, u && u.avatar_url));
-    avatarButton.onclick = () => { if (u) openProfile(uid); };
+    avatarButton.onclick = (event) => { event.stopPropagation(); openDM(uid); };
+    row.onclick = (event) => { if (!event.target.closest(".dm-avatar-button")) openDM(uid); };
     const b = el("button", null, "chan dm-thread dm-thread-copy" + (view.uid === uid ? " active" : "") + (unread ? " unread" : ""));
     b.type = "button";
+    b.onclick = (event) => { event.stopPropagation(); openDM(uid); };
     if (unread) b.setAttribute("aria-label", name + ", " + unread + " unread messages");
     const meta = el("span");
     const dmName = el("div", null, "dm-title-line");
@@ -7379,7 +9009,6 @@ async function renderDmList(refresh = true) {
     meta.appendChild(el("div", String(last.content).slice(0, 34), "muted small"));
     b.appendChild(meta);
     if (unread) b.appendChild(el("span", unread > 99 ? "99+" : String(unread), "dm-unread"));
-    b.onclick = () => openDM(uid);
     row.append(avatarButton, b);
     list.appendChild(row);
   }
@@ -7733,8 +9362,10 @@ function paintActiveNow() {
   }
 }
 
+let dmOpenSequence = 0;
 async function openDM(uid) {
   if (uid === session.user.id) return;
+  const openSequence = ++dmOpenSequence;
   setMobileNav(false);
   view = { type: "dm", uid };
   showView("chat-view");
@@ -7753,7 +9384,7 @@ async function openDM(uid) {
   ensureDmSub();
   renderServerRail();
   $("server-header").textContent = "Direct Messages";
-  await renderDmList(true);
+  $("member-count").textContent = "1 member";
   const u = users.find((x) => x.id === uid);
   const name = u ? u.username : "unknown";
   $("channel-hash").textContent = "";
@@ -7788,18 +9419,31 @@ async function openDM(uid) {
   typingUsers.clear();
   renderTyping();
   const me = session.user.id;
-  const { data } = await supabase.from("dms").select("*")
-    .or(`and(sender_id.eq.${me},receiver_id.eq.${uid}),and(sender_id.eq.${uid},receiver_id.eq.${me})`)
-    .order("id").limit(100);
-  box.innerHTML = "";
-  for (const d of data || []) {
-    appendMessage({ id: d.id, user_id: d.sender_id, content: d.content, created_at: d.created_at }, false);
+  const [sent, received] = await Promise.all([
+    supabase.from("dms").select("*").eq("sender_id", me).eq("receiver_id", uid).order("id", { ascending: false }).limit(100),
+    supabase.from("dms").select("*").eq("sender_id", uid).eq("receiver_id", me).order("id", { ascending: false }).limit(100)
+  ]);
+  if (openSequence !== dmOpenSequence || view.type !== "dm" || view.uid !== uid) return;
+  if (sent.error || received.error) {
+    box.replaceChildren(el("div", "Couldn't load this conversation: " + ((sent.error || received.error).message || "database error"), "empty-note"));
+    toast("Couldn't load this DM. Verify the DM Supabase schema and policies.", "err");
+    return;
   }
+  const data = [...(sent.data || []), ...(received.data || [])]
+    .sort((a, b) => Number(a.id) - Number(b.id)).slice(-100);
+  box.replaceChildren();
+  for (const d of data) await appendMessage({ id: d.id, user_id: d.sender_id, content: d.content, created_at: d.created_at }, false);
+  if (openSequence !== dmOpenSequence || view.type !== "dm" || view.uid !== uid) return;
   if (!(data || []).length) box.appendChild(el("div", "No messages yet — say hi! 👋", "empty-note"));
   box.scrollTop = box.scrollHeight;
+  $("member-count").textContent = "1 member";
   stickBottom = true;
   unreadCount = 0;
   $("scroll-pill").classList.add("hidden");
+  // Refresh the sidebar/profile data after the conversation is visible; don't
+  // block DM navigation on the global directory query.
+  refreshUsers(true);
+  renderDmList(false);
 }
 
 /* ---------------- voice channels (presence + WebRTC mesh, best effort) ---------------- */
@@ -8211,12 +9855,35 @@ async function leaveVoice(silent) {
   }
 }
 
+async function toggleVoiceMute() {
+  voiceMuted = !voiceMuted;
+  if (localStream) for (const track of localStream.getAudioTracks()) track.enabled = !voiceMuted;
+  await updateVoicePresence();
+  paintVoiceButtons();
+}
+
+async function toggleVoiceDeafen() {
+  voiceDeaf = !voiceDeaf;
+  for (const [, entry] of voicePcs) if (entry.audio) entry.audio.muted = voiceDeaf;
+  await updateVoicePresence();
+  paintVoiceButtons();
+}
+
 function paintVoiceButtons() {
   const vm = $("voice-mute"), vd = $("voice-deafen");
   vm.replaceChildren(icon(voiceMuted ? "micOff" : "mic"));
   vm.classList.toggle("off", voiceMuted);
   vd.replaceChildren(icon("phones"));
   vd.classList.toggle("off", voiceDeaf);
+  const dockMute = $("voice-dock-mute"), dockDeafen = $("voice-dock-deafen");
+  dockMute.replaceChildren(icon(voiceMuted ? "micOff" : "mic"));
+  dockMute.classList.toggle("off", voiceMuted);
+  dockMute.title = voiceMuted ? "Unmute microphone" : "Mute microphone";
+  dockMute.setAttribute("aria-label", dockMute.title);
+  dockDeafen.replaceChildren(icon("phones"));
+  dockDeafen.classList.toggle("off", voiceDeaf);
+  dockDeafen.title = voiceDeaf ? "Undeafen audio" : "Deafen audio";
+  dockDeafen.setAttribute("aria-label", dockDeafen.title);
   const share = $("voice-share");
   if (share) share.classList.toggle("active", !!screenStream);
 }
@@ -8335,7 +10002,10 @@ let dashboardSnapshot = {
   users: [], msgCount: {}, latestIp: {}, activities: [], reports: [], channels: {},
   reportError: null, gameScores: [], gameCount: null, gameError: null
 };
+let auditCursor = null, auditHasMore = false, auditLoading = false, auditGeneration = 0;
 async function loadDashboard() {
+  auditGeneration++;
+  auditLoading = false;
   const refresh = $("dash-refresh");
   refresh.disabled = true;
   $("admin-updated").textContent = "Refreshing dashboard data…";
@@ -8368,6 +10038,8 @@ async function loadDashboard() {
     for (const message of messages) msgCount[message.user_id] = (msgCount[message.user_id] || 0) + 1;
     const latestIp = {};
     for (const entry of ips) if (!(entry.user_id in latestIp)) latestIp[entry.user_id] = entry.ip;
+    auditCursor = activities.length ? activities[activities.length - 1].id : null;
+    auditHasMore = activities.length === 100;
     dashboardSnapshot = {
       users, msgCount, latestIp, activities,
       reports: reportResult.data || [],
@@ -8379,7 +10051,10 @@ async function loadDashboard() {
       gameError: gameResult.error || gameCountResult.error
     };
     $("currency-admin-section").classList.toggle("hidden", !isAdmin());
+    $("crypto-admin-section").classList.toggle("hidden", !isAdmin());
+    $("admin-audit-section").classList.toggle("hidden", !isAdmin());
     populateCurrencyMembers();
+    populateCryptoGrantMembers();
     const canManageCosmetics = profile && ["admin", "mod"].includes(profile.role);
     $("shop-admin-section").classList.toggle("hidden", !canManageCosmetics);
     if (canManageCosmetics) renderShopAdmin();
@@ -8546,21 +10221,99 @@ function populateCurrencyMembers() {  const select = $("grant-currency-user");
   if (dashboardSnapshot.users.some((member) => member.id === selected)) select.value = selected;
 }
 
+function populateCryptoGrantMembers() {
+  const select = $("crypto-grant-user");
+  if (!select) return;
+  const selected = select.value;
+  select.replaceChildren();
+  const placeholder = el("option", "Choose a member");
+  placeholder.value = "";
+  select.appendChild(placeholder);
+  for (const member of [...dashboardSnapshot.users].sort((a, b) => a.username.localeCompare(b.username))) {
+    const option = el("option", member.username + (member.role === "admin" ? " · admin" : ""));
+    option.value = member.id;
+    select.appendChild(option);
+  }
+  if (dashboardSnapshot.users.some((member) => member.id === selected)) select.value = selected;
+}
+
+async function grantCryptoFromDashboard() {
+  if (!isAdmin()) return;
+  const target = dashboardSnapshot.users.find((member) => member.id === $("crypto-grant-user").value);
+  const kind = $("crypto-grant-kind").value;
+  const remove = $("crypto-grant-direction").value === "remove";
+  const rawAmount = $("crypto-grant-amount").value;
+  if (!target) { toast("Choose a member first.", "err"); return; }
+  let amount = Number(rawAmount);
+  if (["PING", "BOOST", "RIG"].includes(kind)) {
+    const max = kind === "PING" ? 1000000000 : kind === "BOOST" ? 480 : 5;
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > max) {
+      toast(kind === "PING" ? "Enter a whole PING amount up to 1,000,000,000." : kind === "BOOST" ? "Enter 1–480 active boost minutes." : "Enter 1–5 rig levels.", "err");
+      return;
+    }
+  } else {
+    amount = normalizeCryptoAmount(rawAmount);
+    if (amount === null) { toast("Enter an altcoin amount with up to 6 decimal places.", "err"); return; }
+  }
+  const unit = kind === "PING" ? "PING" : kind === "BOOST" ? "boost minutes" : kind === "RIG" ? "rig levels" : kind;
+  const confirmed = await showModal({
+    title: remove ? "Confirm crypto removal" : "Confirm crypto grant",
+    body: `${remove ? "Take away" : "Grant"} ${amount.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${unit} ${remove ? "from" : "to"} @${target.username}? This admin action is recorded.`,
+    okText: remove ? "Take away" : "Grant"
+  });
+  if (confirmed !== true) return;
+  const submit = $("crypto-grant-submit");
+  submit.disabled = true;
+  try {
+    const rpc = remove ? "ping_admin_remove_crypto" : "ping_admin_grant_crypto";
+    const { error } = await supabase.rpc(rpc, { p_user_id: target.id, p_kind: kind, p_amount: amount });
+    if (error) throw error;
+  } catch (error) {
+    toast("Crypto adjustment failed: " + (error.message || "connection error"), "err");
+    submit.disabled = false;
+    return;
+  }
+  submit.disabled = false;
+  $("crypto-grant-amount").value = "";
+  await loadDashboard();
+  toast(`${remove ? "Removed" : "Granted"} ${amount.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${unit} ${remove ? "from" : "to"} @${target.username}.`, "ok");
+}
+
 async function grantCurrencyFromDashboard() {
   if (!isAdmin()) return;
   const target = dashboardSnapshot.users.find((member) => member.id === $("grant-currency-user").value);
   const amount = Number($("grant-currency-amount").value);
+  const remove = $("grant-currency-direction").value === "remove";
   if (!target) { toast("Choose a member first.", "err"); return; }
   if (!Number.isInteger(amount) || amount < 1 || amount > 100000) {
     toast("Enter a whole number from 1 to 100,000.", "err"); return;
   }
   const confirmed = await showModal({
-    title: "Confirm coin grant",
-    body: `Give ${amount.toLocaleString()} Ping coins to ${target.username}? This will be recorded in the wallet ledger.`,
-    okText: "Grant coins"
+    title: remove ? "Confirm coin removal" : "Confirm coin grant",
+    body: `${remove ? "Take away" : "Give"} ${amount.toLocaleString()} Ping coins ${remove ? "from" : "to"} @${target.username}? This will be recorded in the wallet ledger.`,
+    okText: remove ? "Take away" : "Give coins"
   });
   if (confirmed !== true) return;
-  if (await grantCoinsToUser(target, amount)) $("grant-currency-amount").value = "";
+  const ok = remove ? await removeCoinsFromUser(target, amount) : await grantCoinsToUser(target, amount);
+  if (ok) $("grant-currency-amount").value = "";
+}
+
+async function removeCoinsFromUser(target, amount) {
+  if (!isAdmin()) return false;
+  let data;
+  try {
+    const result = await supabase.rpc("ping_admin_remove_coins", {
+      p_user_id: target.id, p_amount: amount
+    });
+    if (result.error) throw result.error;
+    data = result.data;
+  } catch (error) {
+    toast("Coin removal failed: " + (error.message || "connection error"), "err");
+    return false;
+  }
+  await loadDashboard();
+  toast(`Removed ${amount.toLocaleString()} Ping coins from @${target.username}. New balance: ${Number(data).toLocaleString()}.`, "ok");
+  return true;
 }
 
 async function grantCoinsToUser(target, amount, { refreshDashboard = true } = {}) {
@@ -8667,13 +10420,16 @@ function renderDashboardGames() {
   const tttWins = rows.filter((row) => row.game_id === "tictactoe" && row.result === "win").length;
   const quickdraws = rows.filter((row) => row.game_id === "quickdraw");
   const scrambles = rows.filter((row) => row.game_id === "scramble");
+  const memories = rows.filter((row) => row.game_id === "memory");
   const bestReaction = quickdraws.length ? Math.min(...quickdraws.map((row) => Number(row.score))) : null;
   const bestScramble = scrambles.length ? Math.max(...scrambles.map((row) => Number(row.score))) : null;
+  const bestMemory = memories.length ? Math.max(...memories.map((row) => Number(row.score))) : null;
   for (const [label, value] of [
     ["Saved games", dashboardSnapshot.gameCount ?? "—"],
     ["Recent Tic-Tac-Toe wins", tttWins],
     ["Best recent Quickdraw", bestReaction === null ? "—" : bestReaction + " ms"],
-    ["Best recent Scramble", bestScramble === null ? "—" : bestScramble + " points"]
+    ["Best recent Scramble", bestScramble === null ? "—" : bestScramble + " points"],
+    ["Best Memory Match", bestMemory === null ? "—" : bestMemory + " points"]
   ]) {
     const chip = el("div", null, "game-admin-chip");
     chip.append(el("strong", String(value)), el("span", label));
@@ -8685,8 +10441,11 @@ function renderDashboardGames() {
   }
   for (const row of rows.slice(0, 8)) {
     const user = dashboardSnapshot.users.find((member) => member.id === row.user_id);
-    const game = row.game_id === "quickdraw" ? "Quickdraw" : row.game_id === "scramble" ? "Word Scramble" : "Tic-Tac-Toe";
-    const result = row.game_id === "quickdraw" ? `${row.score} ms reaction` : row.game_id === "scramble" ? `${row.score} points` : row.result;
+    const game = ({ quickdraw: "Quickdraw", scramble: "Word Scramble", wordle: "Wordle", minesweeper: "Minesweeper", memory: "Memory Match", tictactoe: "Tic-Tac-Toe" })[row.game_id] || "Ping Arcade";
+    const result = row.game_id === "quickdraw" ? `${row.score} ms reaction`
+      : ["scramble", "memory"].includes(row.game_id) ? `${row.score} points`
+        : row.game_id === "wordle" ? (row.result === "win" ? `${row.score} points · solved` : "unsolved")
+          : row.game_id === "minesweeper" ? (row.result === "win" ? `${row.score} points · cleared` : "boom") : row.result;
     const item = el("div", null, "game-admin-row");
     item.append(el("strong", `${user ? "@" + user.username : "Player"} · ${game}`), el("span", `${result} · ${fmtTime(row.created_at)}`));
     feed.appendChild(item);
@@ -8774,27 +10533,80 @@ function renderDashboardUsers() {
   }
 }
 
-function renderDashboardActivity() {
-  const eventFilter = $("activity-filter").value;
-  const feed = $("activity-feed");
-  feed.innerHTML = "";
-  const regularActivity = dashboardSnapshot.activities.filter((a) =>
-    !a.action.startsWith("mod_") && (eventFilter === "all" || a.action === eventFilter)).slice(0, 30);
-  for (const a of regularActivity) {
-    const d = el("div", null, "feed-item");
-    d.appendChild(el("b", `${a.username} — ${a.action}${a.detail ? ": " + a.detail : ""}`));
-    d.appendChild(el("span", fmtTime(a.created_at) + (a.ip ? " · " + a.ip : ""), "t"));
-    feed.appendChild(d);
+function filteredAuditActivities() {
+  return filterAuditEvents(dashboardSnapshot.activities, {
+    category: $("activity-filter").value,
+    query: $("audit-search").value,
+    from: $("audit-from").value,
+    through: $("audit-through").value
+  });
+}
+function exportAuditCsv() {
+  const rows = filteredAuditActivities();
+  if (!rows.length) { toast("There are no loaded events matching these filters.", "err"); return; }
+  const csv = auditEventsToCsv(rows);
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "ping-audit-" + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(rows.length + " audit events exported.", "ok");
+}
+async function loadOlderAuditEvents() {
+  if (!isAdmin() || !auditHasMore || !auditCursor || auditLoading) return;
+  auditLoading = true;
+  const generation = auditGeneration;
+  const button = $("activity-load-more");
+  button.disabled = true;
+  button.textContent = "Loading…";
+  try {
+    const { data, error } = await supabase.from("activity_log").select("*")
+      .lt("id", auditCursor).order("id", { ascending: false }).limit(100);
+    if (generation !== auditGeneration) return;
+    if (error) { toast("Couldn't load older audit events: " + error.message, "err"); return; }
+    const older = data || [];
+    if (older.length) {
+      auditCursor = older[older.length - 1].id;
+      dashboardSnapshot.activities.push(...older);
+    } else {
+      auditCursor = null;
+    }
+    auditHasMore = older.length === 100;
+  } finally {
+    if (generation === auditGeneration) {
+      auditLoading = false;
+      renderDashboardActivity();
+    }
   }
-  if (!feed.children.length) feed.appendChild(el("p", eventFilter === "all" ? "No activity yet." : "No events match this filter.", "muted admin-feed-empty"));
+}
+function renderDashboardActivity() {
+  const feed = $("activity-feed");
+  feed.replaceChildren();
+  const filtered = filteredAuditActivities();
+  const loaded = dashboardSnapshot.activities || [];
+  $("activity-count").textContent = `${filtered.length} shown · ${loaded.length}${auditHasMore ? "+" : ""} loaded`;
+  for (const activity of filtered) {
+    const row = el("div", null, "feed-item");
+    row.appendChild(el("b", `${activity.username || "Unknown user"} — ${activity.action}${activity.detail ? ": " + activity.detail : ""}`));
+    row.appendChild(el("span", fmtTime(activity.created_at) + (activity.ip ? " · " + activity.ip : ""), "t"));
+    feed.appendChild(row);
+  }
+  if (!feed.children.length) feed.appendChild(el("p", loaded.length ? "No events match these filters." : "No activity is available.", "muted admin-feed-empty"));
+  const loadMore = $("activity-load-more");
+  loadMore.classList.toggle("hidden", !auditHasMore);
+  loadMore.disabled = auditLoading;
+  loadMore.textContent = auditLoading ? "Loading…" : "Load older events";
 
   const mod = $("mod-log");
-  mod.innerHTML = "";
-  for (const a of dashboardSnapshot.activities.filter((x) => x.action.startsWith("mod_")).slice(0, 30)) {
-    const d = el("div", null, "mod-item");
-    d.appendChild(el("b", `${a.username} — ${a.action}: ${a.detail}`));
-    d.appendChild(el("span", fmtTime(a.created_at), "t"));
-    mod.appendChild(d);
+  mod.replaceChildren();
+  for (const activity of loaded.filter((item) => String(item.action || "").startsWith("mod_")).slice(0, 30)) {
+    const row = el("div", null, "mod-item");
+    row.appendChild(el("b", `${activity.username || "Unknown user"} — ${activity.action}: ${activity.detail || ""}`));
+    row.appendChild(el("span", fmtTime(activity.created_at), "t"));
+    mod.appendChild(row);
   }
   if (!mod.children.length) mod.appendChild(el("p", "No moderation actions yet.", "muted"));
 }

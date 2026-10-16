@@ -2,12 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="A friendly real-time chat home for your community." />
-<meta name="theme-color" content="#1e1f22" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="description" content="Ping is a friendly home for your community: chat, share, and hang out together." />
+<meta name="theme-color" content="#101117" />
+<meta name="application-name" content="Ping" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Ping — Community Chat</title>
-<link rel="icon" href="favicon.svg?v=50" type="image/svg+xml" />
-<link rel="stylesheet" href="styles.css?v=50" />
+<link rel="icon" href="favicon.svg?v=51" type="image/svg+xml" />
+<link rel="manifest" href="site.webmanifest?v=1" />
+<link rel="stylesheet" href="styles.css?v=76" />
 </head>
 <body>
 
@@ -68,6 +72,8 @@
   <nav id="server-rail">
     <button class="server-icon home active" data-server="home" title="Home">⌂</button>
     <div class="rail-sep"></div>
+    <button id="quick-switcher-btn" class="server-icon quick-switcher-btn" type="button" title="Quick switcher (Ctrl+K)" aria-label="Quick switcher" aria-haspopup="dialog" aria-expanded="false" aria-controls="quick-switcher-dialog">⌕</button>
+    <button id="server-folders-btn" class="server-icon folder-manager" type="button" title="Organize servers" aria-label="Organize servers">🗂</button>
     <div id="server-icons"></div>
     <button id="add-server-btn" class="server-icon add" title="Create server">＋</button>
     <button id="explore-btn" class="server-icon" title="Explore servers">🧭</button>
@@ -86,11 +92,12 @@
     <div class="mod-notice">🛡️ Messages and logins are logged for moderation.</div>
     <div id="channel-list"></div>
     <div id="user-panel">
-      <div id="user-avatar" class="avatar">?</div>
-      <div class="user-meta">
-        <div id="user-name">user</div>
-        <button id="user-role" class="muted small user-presence-control" type="button" aria-haspopup="menu" aria-expanded="false">Online</button>
-      </div>
+        <div id="user-avatar" class="avatar">?</div>
+        <div class="user-meta">
+          <div id="user-name">user</div>
+          <button id="user-role" class="muted small user-presence-control" type="button" aria-haspopup="menu" aria-expanded="false">Online</button>
+          <button id="user-rich-presence" class="user-rich-presence hidden" type="button" aria-label="View current activity"></button>
+        </div>
       <button id="dashboard-btn" class="icon-btn hidden" title="Admin Dashboard">👑</button>
       <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
       <button id="logout-btn" class="icon-btn" title="Log out">⏻</button>
@@ -111,13 +118,16 @@
         <button id="invite-btn" class="icon-btn hidden" type="button" title="Invite people to this server" aria-label="Invite people to this server">↗</button>
         <button id="pins-btn" class="icon-btn hidden" type="button" title="Pinned messages">📌</button>
         <button id="saved-btn" class="icon-btn" type="button" title="Saved messages" aria-label="Saved messages">☆</button>
-        <button id="search-btn" class="icon-btn hidden" type="button" title="Search messages">🔍</button>
+        <button id="search-btn" class="icon-btn hidden" type="button" title="Search messages across servers">🔍</button>
         <button id="call-btn" class="icon-btn hidden" type="button" title="Start voice call" aria-label="Start voice call">📞</button>
         <button id="members-toggle" class="icon-btn" type="button" title="Toggle member list" aria-label="Toggle member list" aria-pressed="false">♟</button>
         <span id="member-count" class="muted"></span>
       </header>
       <div id="search-bar" class="hidden">
-        <input id="search-input" type="text" placeholder="Search this server…" maxlength="80" />
+        <div class="search-controls">
+          <input id="search-input" type="search" placeholder="Search messages across servers…" maxlength="80" aria-label="Search messages" />
+          <button id="search-scope-btn" type="button" aria-pressed="true" title="Search all servers you can access">All servers</button>
+        </div>
         <div id="search-results" class="hidden"></div>
       </div>
       <div id="messages"></div>
@@ -213,6 +223,7 @@
         <button class="btn-secondary back-to-chat" type="button">← Back to chat</button>
       </header>
       <p class="muted small">Daily quests reset at midnight UTC. Claim coins when complete.</p>
+      <div id="quest-reset-countdown" class="quest-reset-countdown muted small"></div>
       <div id="quests-list"></div>
     </div>
 
@@ -293,13 +304,27 @@
       </section>
       <section id="currency-admin-section" class="admin-section hidden">
         <div class="admin-section-heading">
-          <div><h3>Give Ping coins</h3><p>Grant currency to a member. Every grant is recorded in the wallet ledger.</p></div>
+          <div><h3>Adjust Ping coins</h3><p>Grant coins or remove coins from a member. Changes are recorded in the wallet ledger.</p></div>
           <span class="admin-count">Admin only</span>
         </div>
         <div class="currency-controls">
           <label><span>Member</span><select id="grant-currency-user"><option value="">Choose a member</option></select></label>
+          <label><span>Action</span><select id="grant-currency-direction"><option value="grant">Give coins</option><option value="remove">Take away coins</option></select></label>
           <label><span>Coins</span><input id="grant-currency-amount" type="number" min="1" max="100000" step="1" placeholder="100" /></label>
-          <button id="grant-currency-submit" class="btn-primary" type="button">Grant coins</button>
+          <button id="grant-currency-submit" class="btn-primary" type="button">Give coins</button>
+        </div>
+      </section>
+      <section id="crypto-admin-section" class="admin-section hidden">
+        <div class="admin-section-heading">
+          <div><h3>Adjust crypto assets</h3><p>Give or take away tokens, boost fuel, or rig levels from a member.</p></div>
+          <span class="admin-count">Admin only</span>
+        </div>
+        <div class="crypto-admin-controls">
+          <label><span>Member</span><select id="crypto-grant-user"><option value="">Choose a member</option></select></label>
+          <label><span>Action</span><select id="crypto-grant-direction"><option value="grant">Give asset</option><option value="remove">Take away asset</option></select></label>
+          <label><span>Asset or upgrade</span><select id="crypto-grant-kind"><option value="PING">Ping Crypto (whole units)</option><option value="BTC">Bitcoin (BTC)</option><option value="ETH">Ethereum (ETH)</option><option value="SOL">Solara (SOL)</option><option value="DOGE">Dogecoin (DOGE)</option><option value="BOOST">Miner boost (minutes)</option><option value="RIG">Miner rig levels</option></select></label>
+          <label><span>Amount</span><input id="crypto-grant-amount" type="number" min="1" step="0.000001" placeholder="1" /></label>
+          <button id="crypto-grant-submit" class="btn-primary" type="button">Give asset</button>
         </div>
       </section>
       <section id="shop-admin-section" class="admin-section hidden">
@@ -341,13 +366,21 @@
         <div id="game-admin-feed"><p class="muted small">Loading game activity…</p></div>
       </section>
       <div class="admin-activity-grid">
-        <section class="admin-section admin-feed-panel">
+        <section id="admin-audit-section" class="admin-section admin-feed-panel admin-audit-section">
           <div class="admin-section-heading">
-            <div><h3>Recent activity</h3><p>Account and community events.</p></div>
-            <label class="sr-only" for="activity-filter">Filter recent activity</label>
-            <select id="activity-filter"><option value="all">All events</option><option value="login">Logins</option><option value="signup">Signups</option><option value="server_create">Servers</option><option value="announce">Announcements</option><option value="voice_join">Voice</option></select>
+            <div><h3>Admin audit explorer</h3><p>Search and export account and community activity. Private messages are excluded.</p></div>
+            <span id="activity-count" class="admin-count">Loading events…</span>
           </div>
-          <div id="activity-feed"><p class="muted">Loading…</p></div>
+          <div class="admin-audit-controls">
+            <label class="admin-search"><span aria-hidden="true">⌕</span><input id="audit-search" type="search" maxlength="80" placeholder="Search username, action, detail, or IP" autocomplete="off" /></label>
+            <label class="sr-only" for="activity-filter">Filter audit events</label>
+            <select id="activity-filter"><option value="all">All events</option><option value="auth">Authentication</option><option value="moderation">Moderation</option><option value="servers">Servers</option><option value="announcements">Announcements</option><option value="voice">Voice</option><option value="economy">Economy</option><option value="games">Games</option><option value="other">Other</option></select>
+            <label class="admin-date-filter"><span>From</span><input id="audit-from" type="date" /></label>
+            <label class="admin-date-filter"><span>Through</span><input id="audit-through" type="date" /></label>
+            <button id="activity-export" class="btn-secondary" type="button">↓ Export CSV</button>
+          </div>
+          <div id="activity-feed" class="admin-audit-feed"><p class="muted">Loading…</p></div>
+          <button id="activity-load-more" class="btn-secondary admin-load-more hidden" type="button">Load older events</button>
         </section>
         <section class="admin-section admin-feed-panel">
           <div class="admin-section-heading"><div><h3>Moderation log</h3><p>Recent safety actions taken by the team.</p></div></div>
@@ -368,13 +401,106 @@
 </div>
 <div id="voice-dock" class="voice-dock hidden">
   <div class="voice-dock-status"><span class="voice-connected-dot"></span><span><strong>Voice Connected</strong><small id="voice-dock-name">Call</small></span></div>
+  <button id="voice-dock-mute" type="button" title="Mute microphone" aria-label="Mute microphone">🎤</button>
+  <button id="voice-dock-deafen" type="button" title="Deafen audio" aria-label="Deafen audio">🎧</button>
   <button id="voice-dock-return" type="button">Return</button>
   <button id="voice-dock-hangup" type="button" aria-label="Leave voice call">☎</button>
 </div>
+<dialog id="server-folder-dialog" class="server-folder-dialog" aria-labelledby="server-folder-title">
+  <div class="server-folder-dialog-content">
+    <header class="server-folder-dialog-header">
+      <div><span class="admin-kicker">YOUR SIDEBAR</span><h2 id="server-folder-title">Organize servers</h2></div>
+      <button id="server-folder-close" class="icon-btn" type="button" aria-label="Close server organizer">✕</button>
+    </header>
+    <p class="muted small">Create folders, reorder with the arrows, or drag server icons into a folder. Your layout is private to this account on this browser.</p>
+    <form id="server-folder-create-form" class="server-folder-create-form">
+      <label class="sr-only" for="server-folder-new-name">New folder name</label>
+      <input id="server-folder-new-name" type="text" maxlength="24" placeholder="New folder name" autocomplete="off" required />
+      <button class="btn-primary" type="submit">Create folder</button>
+    </form>
+    <div id="server-folder-manager-list" class="server-folder-manager-list"></div>
+    <footer class="server-folder-dialog-footer"><button id="server-folder-done" class="btn-secondary" type="button">Done</button></footer>
+  </div>
+</dialog>
+<dialog id="quick-switcher-dialog" class="quick-switcher-dialog" aria-labelledby="quick-switcher-title">
+  <div class="quick-switcher-content">
+    <header class="quick-switcher-header">
+      <h2 id="quick-switcher-title">Jump to</h2>
+      <kbd>ESC</kbd>
+    </header>
+    <label class="sr-only" for="quick-switcher-input">Search servers, channels, people, and Ping views</label>
+    <div class="quick-switcher-search"><span aria-hidden="true">⌕</span><input id="quick-switcher-input" type="search" maxlength="80" placeholder="Search servers, channels, people, and views…" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="quick-switcher-results" aria-autocomplete="list" /></div>
+    <div id="quick-switcher-results" class="quick-switcher-results" role="listbox" aria-label="Quick switcher results"></div>
+    <footer class="quick-switcher-footer"><span><kbd>↑</kbd><kbd>↓</kbd> to move</span><span><kbd>↵</kbd> to open</span><span><kbd>ESC</kbd> to close</span></footer>
+  </div>
+</dialog>
+<dialog id="crypto-dialog" class="crypto-dialog" aria-labelledby="crypto-title">
+  <div class="crypto-dialog-content">
+    <header class="crypto-dialog-header">
+      <div><span class="admin-kicker">PING UNDERGROUND</span><h2 id="crypto-title">Crypto Miner</h2></div>
+      <button id="crypto-close" class="icon-btn" type="button" aria-label="Close crypto menu">✕</button>
+    </header>
+    <p class="crypto-disclaimer muted small">Your rig keeps earning while you are away, up to 12 hours per run.</p>
+    <nav class="crypto-tabs" aria-label="Crypto menus">
+      <button id="crypto-tab-miner" class="active" type="button" aria-pressed="true">⛏ Miner</button>
+      <button id="crypto-tab-market" type="button" aria-pressed="false">♜ Black Market</button>
+    </nav>
+    <div class="crypto-wallet-card">
+      <span class="crypto-wallet-label">PRIVATE WALLET</span>
+      <strong><span id="crypto-balance">0</span><small> PING CRYPTO</small></strong>
+      <span id="crypto-pending" class="crypto-pending"></span>
+    </div>
+    <section id="crypto-miner-panel" class="crypto-panel">
+      <p class="crypto-miner-note muted small">Choose what to mine. Each rig level adds 50% output; boost fuel doubles output for active mining minutes.</p>
+      <label class="crypto-target-row">Mining target<select id="crypto-mining-symbol" aria-label="Choose a mining target"><option value="PING">Ping Crypto · PING</option><option value="BTC">Bitcoin · BTC</option><option value="ETH">Ethereum · ETH</option><option value="SOL">Solara · SOL</option><option value="DOGE">Dogecoin · DOGE</option></select></label>
+      <div id="crypto-miner-status" class="crypto-miner-status">Checking miner…</div>
+      <div class="crypto-rig-meta"><span id="crypto-rig-level">Rig level 0 / 5</span><span id="crypto-rate">60 PING / hour</span><span id="crypto-boost-time"></span></div>
+      <div class="crypto-action-row">
+        <button id="crypto-miner-action" class="btn-primary" type="button">Start mining</button>
+        <button id="crypto-stop-mining" class="btn-secondary hidden" type="button">Stop &amp; claim</button>
+      </div>
+      <div class="crypto-upgrade-row">
+        <button id="crypto-upgrade-btn" class="btn-secondary" type="button">Upgrade miner</button>
+        <button id="crypto-boost-btn" class="btn-secondary" type="button">Buy 60-minute boost</button>
+      </div>
+      <div class="crypto-convert-row">
+        <label for="crypto-convert-amount">Convert PING Crypto to coins <small>10 PING = 1 coin</small></label>
+        <div><input id="crypto-convert-amount" type="number" min="10" step="10" value="10" /><button id="crypto-convert-btn" class="btn-secondary" type="button">Convert</button></div>
+      </div>
+    </section>
+    <section id="blackmarket-panel" class="crypto-panel hidden">
+      <h3>Altcoin wallet</h3>
+      <div id="crypto-asset-holdings" class="crypto-asset-holdings"></div>
+      <h3>Sell to Ping server</h3>
+      <div class="crypto-sell-form">
+        <select id="crypto-sell-symbol" aria-label="Crypto to sell"><option value="BTC">Bitcoin · BTC</option><option value="ETH">Ethereum · ETH</option><option value="SOL">Solara · SOL</option><option value="DOGE">Dogecoin · DOGE</option></select>
+        <input id="crypto-sell-amount" type="number" min="0.0001" step="0.0001" value="1" aria-label="Amount to sell to Ping" />
+        <span id="crypto-sell-quote" class="crypto-quote"></span>
+        <button id="crypto-sell-btn" class="btn-secondary" type="button">Sell for coins</button>
+      </div>
+      <p class="muted small crypto-market-note">Mine variants to earn them. Sell to the server for coins, or trade with players through escrow listings priced in PING.</p>
+      <h3>Player trading board</h3>
+      <form id="crypto-listing-form" class="crypto-listing-form">
+        <label class="sr-only" for="crypto-list-symbol">Asset to sell</label>
+        <select id="crypto-list-symbol"><option value="BTC">Bitcoin · BTC</option><option value="ETH">Ethereum · ETH</option><option value="SOL">Solara · SOL</option><option value="DOGE">Dogecoin · DOGE</option></select>
+        <label class="sr-only" for="crypto-list-amount">Amount to list</label>
+        <input id="crypto-list-amount" type="number" min="0.0001" step="0.0001" value="1" placeholder="Amount" />
+        <label class="sr-only" for="crypto-list-price">Price in PING Crypto</label>
+        <input id="crypto-list-price" type="number" min="1" step="1" value="10" placeholder="Ask in PING" />
+        <button class="btn-secondary" type="submit">List for sale</button>
+      </form>
+      <div id="crypto-market-listings" class="crypto-market-listings"></div>
+      <h3>Black Market inventory</h3>
+      <div id="blackmarket-inventory" class="blackmarket-inventory"></div>
+      <h3>Encrypted goods</h3>
+      <div id="blackmarket-items" class="blackmarket-items"></div>
+    </section>
+  </div>
+</dialog>
 
 <script src="config.js"></script>
 <script src="vendor-supabase-umd.js"></script>
-<script type="module" src="ping-app.js?v=10"></script>
+<script type="module" src="ping-app.js?v=50"></script>
 <script>
 setTimeout(function () {
   if (!window.__pingBooted) {
