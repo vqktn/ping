@@ -1,0 +1,20 @@
+{
+  "id": "./",
+  "name": "Ping — Community Chat",
+  "short_name": "Ping",
+  "description": "A friendly home for your community to chat, share, and hang out together.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101117",
+  "theme_color": "#101117",
+  "categories": ["social", "communication"],
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
